@@ -1,0 +1,23 @@
+services:
+  synology-mcp:
+    # Fertiges Image aus der GitHub Container Registry (per GitHub Actions bei jedem Push auf main gebaut)
+    image: ghcr.io/tabside/synology-mcp:latest
+    pull_policy: always
+    container_name: synology-mcp-cloud
+    restart: unless-stopped
+    environment:
+      - DSM_HOST=${DSM_HOST}
+      - DSM_PORT=${DSM_PORT:-5001}
+      - DSM_HTTPS=${DSM_HTTPS:-true}
+      - DSM_USER=${DSM_USER}
+      - DSM_PASSWORD=${DSM_PASSWORD}
+      - DSM_VERIFY_SSL=${DSM_VERIFY_SSL:-true}
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}
+      - MCP_VOLUME_WARN_PERCENT=${MCP_VOLUME_WARN_PERCENT:-85}
+      - MCP_DISK_TEMP_WARN=${MCP_DISK_TEMP_WARN:-55}
+      - MCP_DISK_LIFE_WARN_PERCENT=${MCP_DISK_LIFE_WARN_PERCENT:-20}
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8000
+    ports:
+      # Zugriffskontrolle ist das Bearer-Token, TLS macht der Reverse-Proxy. Über MCP_BIND_ADDR einschränkbar.
+      - "${MCP_BIND_ADDR:-0.0.0.0}:${MCP_HOST_PORT:-8432}:8000"
