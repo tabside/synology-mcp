@@ -5,7 +5,7 @@ Läuft ausschliesslich als Docker-Container mit Streamable-HTTP-Transport hinter
 Reverse-Proxy und erfordert MCP_AUTH_TOKEN. Ein lokaler Betrieb (stdio/uvx) ist nicht vorgesehen.
 
 Alle Werte kommen aus Umgebungsvariablen (DSM_HOST, DSM_PORT, DSM_USER, DSM_PASSWORD,
-DSM_VERIFY_SSL, DSM_TLS_SERVERNAME, MCP_AUTH_TOKEN, MCP_HOST, MCP_PORT, Schwellwerte) - keine Secrets im Code.
+DSM_VERIFY_SSL, DSM_TLS_SERVERNAME, DSM_TLS_FINGERPRINT, MCP_AUTH_TOKEN, MCP_HOST, MCP_PORT, Schwellwerte) - keine Secrets im Code.
 
 Der Server ist bewusst NUR LESEND:
 - Es gibt keine schreibenden Tools.
@@ -103,6 +103,37 @@ def _base_url() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Zertifikats-Pinning (DSM_TLS_FINGERPRINT = SHA-256 des Server-Zertifikats)
+# ---------------------------------------------------------------------------
+
+def _fingerprint_pin() -> str:
+    return _env("DSM_TLS_FINGERPRINT").replace(":", "").replace(" ", "").lower()
+
+
+def _sha256(der: bytes) -> str:
+    import hashlib
+    return hashlib.sha256(der).hexdigest()
+
+
+def _fmt_fp(hexstr: str) -> str:
+    return ":".join(hexstr[i:i + 2] for i in range(0, len(hexstr), 2)).upper()
+
+
+def _check_pin(resp) -> None:
+    pin = _fingerprint_pin()
+    if not pin:
+        return
+    stream = resp.extensions.get("network_stream")
+    ssl_obj = stream.get_extra_info("ssl_object") if stream else None
+    der = ssl_obj.getpeercert(True) if ssl_obj else None
+    if not der:
+        raise RuntimeError("DSM_TLS_FINGERPRINT gesetzt, aber kein TLS-Zertifikat lesbar (DSM_HTTPS=false?)")
+    import hmac
+    if not hmac.compare_digest(_sha256(der), pin):
+        raise RuntimeError(f"Zertifikat der NAS passt nicht zu DSM_TLS_FINGERPRINT (erhalten {_fmt_fp(_sha256(der))}) - Verbindung abgebrochen")
+
+
+# ---------------------------------------------------------------------------
 # DSM-Fehlercodes
 # ---------------------------------------------------------------------------
 
@@ -159,9 +190,22 @@ class DSMClient:
         # DSM_TLS_SERVERNAME: per IP verbinden, Zertifikat aber gegen den externen Namen prüfen (SNI)
         servername = _env("DSM_TLS_SERVERNAME")
         extensions = {"sni_hostname": servername} if servername else None
-        resp = self.http.post(f"{self.base}/{path}", data=data, headers=headers, extensions=extensions)
-        resp.raise_for_status()
+        # Als Stream, damit das Zertifikat der Verbindung gelesen werden kann, solange sie offen ist
+        with self.http.stream("POST", f"{self.base}/{path}", data=data, headers=headers, extensions=extensions) as resp:
+            _check_pin(resp)
+            resp.raise_for_status()
+            resp.read()
         return resp.json()
+
+    def preflight(self) -> None:
+        """Erster Request ohne Zugangsdaten. Bei Pinning wird das Zertifikat dieser Verbindung
+        geprüft, bevor das Passwort gesendet wird (Pool mit nur einer Verbindung)."""
+        servername = _env("DSM_TLS_SERVERNAME")
+        with self.http.stream("GET", f"{self.base}/query.cgi",
+                              params={"api": "SYNO.API.Info", "version": "1", "method": "query", "query": "SYNO.API.Auth"},
+                              extensions={"sni_hostname": servername} if servername else None) as resp:
+            _check_pin(resp)
+            resp.read()
 
     def api_info(self) -> dict[str, dict]:
         with _api_info_lock:
@@ -222,8 +266,14 @@ class DSMClient:
 @contextmanager
 def dsm():
     import httpx
-    with httpx.Client(verify=_verify(), timeout=30) as http:
+    pinned = bool(_fingerprint_pin())
+    # Bei Pinning ersetzt der Fingerprint-Vergleich die CA-Prüfung (z.B. selbstsigniertes DSM-Zertifikat im LAN)
+    verify = False if pinned else _verify()
+    limits = httpx.Limits(max_connections=1, max_keepalive_connections=1)
+    with httpx.Client(verify=verify, timeout=30, limits=limits, trust_env=False) as http:
         client = DSMClient(http, _base_url())
+        if pinned:
+            client.preflight()
         client.login()
         try:
             yield client
@@ -269,6 +319,56 @@ def _ok(status) -> bool:
 
 def get_version() -> dict:
     return {"version": __version__, "git_sha": _env("GIT_SHA", "unbekannt")}
+
+
+def _decode_der(der: bytes) -> dict:
+    """DER-Zertifikat ohne Zusatzpakete lesbar machen (über die ssl-Testfunktion der Standardbibliothek)."""
+    import tempfile
+    pem = ssl.DER_cert_to_PEM_cert(der)
+    with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=True) as f:
+        f.write(pem)
+        f.flush()
+        info = ssl._ssl._test_decode_cert(f.name)
+    flat = lambda rdns: ", ".join(f"{k}={v}" for rdn in rdns for k, v in rdn)
+    return {"subject": flat(info.get("subject", ())), "issuer": flat(info.get("issuer", ())),
+            "san": [v for k, v in info.get("subjectAltName", ()) if k == "DNS"],
+            "gueltig_ab": info.get("notBefore"), "gueltig_bis": info.get("notAfter"),
+            "selbstsigniert": info.get("subject") == info.get("issuer")}
+
+
+def tls_check() -> dict:
+    """Zeigt, welches Zertifikat die NAS ausliefert, und ob die normale Prüfung klappt. Sendet keine Zugangsdaten."""
+    import socket
+    host, port = _env("DSM_HOST"), int(_env("DSM_PORT", "5001"))
+    if not host:
+        raise RuntimeError("DSM_HOST muss gesetzt sein (Umgebungsvariable)")
+    servername = _env("DSM_TLS_SERVERNAME") or host
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with socket.create_connection((host, port), timeout=10) as sock:
+        with ctx.wrap_socket(sock, server_hostname=servername) as tls:
+            der = tls.getpeercert(binary_form=True)
+            tls_version = tls.version()
+    out = {"verbindung": f"{host}:{port}", "sni": servername, "tls": tls_version, **_decode_der(der),
+           "sha256": _fmt_fp(_sha256(der))}
+    try:
+        vctx = _verify()
+        if vctx is False:
+            out["pruefung"] = "DSM_VERIFY_SSL=false, keine Prüfung"
+        else:
+            if vctx is True:
+                vctx = ssl.create_default_context()
+            with socket.create_connection((host, port), timeout=10) as sock:
+                with vctx.wrap_socket(sock, server_hostname=servername):
+                    pass
+            out["pruefung"] = "ok"
+    except Exception as e:
+        out["pruefung"] = f"fehlgeschlagen: {e}"
+    pin = _fingerprint_pin()
+    if pin:
+        out["pinning"] = "passt" if pin == _sha256(der) else "passt NICHT"
+    return out
 
 
 def _system_info(c: DSMClient) -> dict:
@@ -591,6 +691,7 @@ def api_query(api: str, method: str, params: dict = None, version: str = "max") 
 
 TOOL_FUNCS = {
     "get_version": get_version,
+    "tls_check": tls_check,
     "system_info": system_info,
     "utilization": utilization,
     "storage": storage,
@@ -621,6 +722,7 @@ _EMPTY = {"type": "object", "properties": {}}
 async def list_tools():
     return [
         Tool(name="get_version", description="Version des laufenden Synology-MCP-Servers abfragen (Redeploy-Kontrolle).", inputSchema=_EMPTY),
+        Tool(name="tls_check", description="Diagnose: welches TLS-Zertifikat die NAS ausliefert (Subject, Aussteller, Namen, Gültigkeit, SHA-256) und ob die Prüfung klappt. Sendet keine Zugangsdaten.", inputSchema=_EMPTY),
         Tool(name="system_info", description="NAS: Modell, DSM-Version, CPU, RAM, Temperatur, Uptime (auch als Verbindungstest).", inputSchema=_EMPTY),
         Tool(name="utilization", description="Aktuelle Auslastung: CPU, Load, RAM, Swap, Netzwerk und Disk-I/O.", inputSchema=_EMPTY),
         Tool(name="storage", description="Speicherpools, Volumes mit Belegung und Disks mit Status, SMART, Temperatur und Restlebensdauer.", inputSchema=_EMPTY),

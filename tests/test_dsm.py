@@ -19,6 +19,16 @@ import synology_mcp as sm  # noqa: E402
 class FakeResponse:
     def __init__(self, payload):
         self.payload = payload
+        self.extensions = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return b""
 
     def raise_for_status(self):
         pass
@@ -31,6 +41,9 @@ class FakeHTTP:
     def __init__(self, login_result=None):
         self.posts = []
         self.login_result = login_result or {"success": True, "data": {"sid": "SID", "synotoken": "TOK"}}
+
+    def stream(self, method, url, data=None, headers=None, extensions=None, params=None):
+        return self.post(url, data, headers, extensions)
 
     def post(self, url, data, headers, extensions=None):
         self.posts.append((url, data, headers))
@@ -217,3 +230,46 @@ def test_tls_servername_sets_sni(monkeypatch):
     monkeypatch.delenv("DSM_TLS_SERVERNAME")
     c.logout()
     assert seen[-1] is None
+
+
+# ---------------------------------------------------------------------------
+# Zertifikats-Pinning
+# ---------------------------------------------------------------------------
+
+class _SSLObj:
+    def __init__(self, der):
+        self.der = der
+
+    def getpeercert(self, binary_form):
+        return self.der
+
+
+class _Stream:
+    def __init__(self, der):
+        self.obj = _SSLObj(der)
+
+    def get_extra_info(self, name):
+        return self.obj if name == "ssl_object" else None
+
+
+class _Resp:
+    def __init__(self, der):
+        self.extensions = {"network_stream": _Stream(der)}
+
+
+def test_pin_match_and_mismatch(monkeypatch):
+    der = b"zertifikat"
+    fp = sm._fmt_fp(sm._sha256(der))
+    monkeypatch.setenv("DSM_TLS_FINGERPRINT", fp)
+    sm._check_pin(_Resp(der))  # mit Doppelpunkten
+    monkeypatch.setenv("DSM_TLS_FINGERPRINT", fp.replace(":", "").lower())
+    sm._check_pin(_Resp(der))  # ohne Doppelpunkte
+    with pytest.raises(RuntimeError, match="passt nicht"):
+        sm._check_pin(_Resp(b"anderes"))
+    with pytest.raises(RuntimeError, match="kein TLS"):
+        sm._check_pin(_Resp(None))
+
+
+def test_no_pin_no_check(monkeypatch):
+    monkeypatch.delenv("DSM_TLS_FINGERPRINT", raising=False)
+    sm._check_pin(object())  # darf nichts anfassen
