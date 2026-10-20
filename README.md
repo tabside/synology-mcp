@@ -19,7 +19,7 @@ Der Server ist **nur lesend**:
 | `tls_check` | Diagnose: welches Zertifikat die NAS ausliefert (Aussteller, Namen, Gültigkeit, SHA-256) und ob die Prüfung klappt, ohne Zugangsdaten |
 | `system_info` | Modell, DSM-Version, CPU, RAM, Temperatur, Uptime (auch Verbindungstest) |
 | `utilization` | CPU, Load, RAM, Swap, Netzwerk, Disk-I/O |
-| `storage` | Speicherpools, Volumes mit Belegung, Disks mit Status, SMART, Temperatur, Restlebensdauer |
+| `storage` | Speicherpools (zugewiesener Anteil), Volumes mit Belegung, Disks mit Status, SMART, UNC-Fehler, Temperatur, Restlebensdauer |
 | `backup_tasks` | Hyper-Backup-Aufgaben mit letztem Ergebnis, letzter und nächster Ausführung |
 | `updates` | Ist ein DSM-Update verfügbar? |
 | `packages` | Installierte Pakete mit Version und Status |
@@ -32,7 +32,7 @@ Der Server ist **nur lesend**:
 | `api_list` | Verfügbare DSM-APIs mit Versionen |
 | `api_query` | Lesender Aufruf einer beliebigen DSM-API für Fälle ohne eigenes Tool |
 
-`health_report` meldet als Auffälligkeit: Temperatur-Warnung des Systems, Pools/Volumes/Disks mit Status ungleich `normal`, SMART ungleich `normal`, Volumes ab `MCP_VOLUME_WARN_PERCENT`, Disks ab `MCP_DISK_TEMP_WARN` °C, überschrittene Grenze für fehlerhafte Sektoren, Restlebensdauer unter der DSM-Grenze oder unter `MCP_DISK_LIFE_WARN_PERCENT`, Backups mit fehlgeschlagenem letzten Ergebnis, verfügbare Updates und Befunde des Security Advisors. Teile, die nicht gelesen werden können, erscheinen ebenfalls als Auffälligkeit.
+`health_report` meldet als Auffälligkeit: Temperatur-Warnung des Systems, Pools/Volumes/Disks mit Status ungleich `normal`, SMART ungleich `normal`, unkorrigierbare Sektorfehler (UNC), Volumes ab `MCP_VOLUME_WARN_PERCENT`, Disks ab `MCP_DISK_TEMP_WARN` °C, überschrittene Grenze für fehlerhafte Sektoren, Restlebensdauer unter der DSM-Grenze oder unter `MCP_DISK_LIFE_WARN_PERCENT`, Backups mit fehlgeschlagenem letzten Ergebnis, verfügbare Updates und Befunde des Security Advisors. Teile, die nicht gelesen werden können, erscheinen ebenfalls als Auffälligkeit.
 
 ## Umgebungsvariablen
 

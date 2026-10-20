@@ -309,6 +309,13 @@ def _remain_life(disk: dict):
     return rl if rl not in (None, -1) else None
 
 
+def _epoch(v) -> str | None:
+    n = _num(v)
+    if not n:
+        return v
+    return datetime.fromtimestamp(n, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 def _ok(status) -> bool:
     return str(status).lower() in ("normal", "safe", "")
 
@@ -411,10 +418,13 @@ def _utilization(c: DSMClient) -> dict:
     net = next((n for n in d.get("network", []) if n.get("device") == "total"), None)
     return {
         "cpu_prozent": sum(int(cpu.get(k) or 0) for k in ("user_load", "system_load", "other_load")),
-        "load_1_5_15": [cpu.get("1min_load"), cpu.get("5min_load"), cpu.get("15min_load")],
+        # DSM liefert die Load mal 100 (225 = 2.25)
+        "load_1_5_15": [round(v / 100, 2) if isinstance(v, (int, float)) else v
+                        for v in (cpu.get("1min_load"), cpu.get("5min_load"), cpu.get("15min_load"))],
         "ram_prozent": mem.get("real_usage"),
         "ram_total_gb": round(total_kb / 1024 ** 2, 1) if total_kb else None,
         "ram_frei_gb": round(avail_kb / 1024 ** 2, 1) if avail_kb is not None else None,
+        "ram_cache_gb": round((_num(mem.get("cached")) or 0) / 1024 ** 2, 1),
         "swap_prozent": mem.get("swap_usage"),
         "netz_rx_kbs": round(net["rx"] / 1024, 1) if net and isinstance(net.get("rx"), (int, float)) else None,
         "netz_tx_kbs": round(net["tx"] / 1024, 1) if net and isinstance(net.get("tx"), (int, float)) else None,
@@ -437,7 +447,8 @@ def _storage(c: DSMClient) -> dict:
         "id": p.get("id"), "status": p.get("status"),
         "raid": p.get("device_type") or p.get("raidType"),
         "groesse_gb": _gb((p.get("size") or {}).get("total")),
-        "belegt_prozent": _pct((p.get("size") or {}).get("used"), (p.get("size") or {}).get("total")),
+        # Anteil des Pools, der Volumes zugewiesen ist (nicht die Datenbelegung, die steht beim Volume)
+        "zugewiesen_prozent": _pct((p.get("size") or {}).get("used"), (p.get("size") or {}).get("total")),
         "disks": p.get("disks"),
     } for p in d.get("storagePools", [])]
     volumes = [{
@@ -560,9 +571,18 @@ def _security(c: DSMClient) -> dict:
     items = d.get("items") or {}
     risky = {k: v.get("failSeverity") for k, v in items.items()
              if isinstance(v, dict) and not _ok(v.get("failSeverity"))}
-    return {"gesamtstatus": d.get("sysStatus"), "letzter_scan": d.get("lastScanTime"),
-            "laeuft": d.get("sysProgress") not in (None, 100) if d.get("sysProgress") is not None else None,
-            "kategorien_mit_befund": risky}
+    out = {"gesamtstatus": d.get("sysStatus"), "letzter_scan": _epoch(d.get("lastScanTime")),
+           "laeuft": d.get("sysProgress") not in (None, 100) if d.get("sysProgress") is not None else None,
+           "kategorien_mit_befund": risky}
+    try:
+        rules = c.call("SYNO.Core.SecurityScan.Status", "rule_get", items="ALL").get("items") or {}
+        out["fehlgeschlagene_regeln"] = sorted(
+            ({"regel": r.get("strId") or k, "kategorie": r.get("category"), "schwere": r.get("severity")}
+             for k, r in rules.items() if isinstance(r, dict) and r.get("status") == "fail"),
+            key=lambda r: (r["kategorie"] or "", r["regel"]))
+    except Exception as e:
+        out["fehlgeschlagene_regeln"] = {"fehler": str(e)}
+    return out
 
 
 def security_advisor() -> dict:
@@ -623,6 +643,9 @@ def health_report() -> dict:
             issues.append(f"Disk {name}: SMART {d.get('smart_status')}")
         if (_num(d.get("temperatur_c")) or 0) >= temp_warn:
             issues.append(f"Disk {name}: {d.get('temperatur_c')} °C (Grenze {temp_warn:g} °C)")
+        unc = _num(d.get("unc"))
+        if unc and unc > 0:
+            issues.append(f"Disk {name}: {unc:g} unkorrigierbare Sektorfehler (UNC) - Disk beobachten, Ersatz bereithalten")
         if d.get("bad_sector_grenze_ueberschritten"):
             issues.append(f"Disk {name}: Grenze für fehlerhafte Sektoren überschritten")
         if d.get("restlebensdauer_unter_grenze"):
@@ -644,7 +667,10 @@ def health_report() -> dict:
         issues.append(f"DSM-Update verfügbar: {report['updates'].get('version')}")
 
     sec = report.get("security_advisor") or {}
-    if sec.get("kategorien_mit_befund"):
+    rules = sec.get("fehlgeschlagene_regeln")
+    if isinstance(rules, list) and rules:
+        issues.append("Security Advisor: " + ", ".join(f"{r['regel']} ({r['schwere']})" for r in rules))
+    elif sec.get("kategorien_mit_befund"):
         issues.append(f"Security Advisor: Befunde in {', '.join(sec['kategorien_mit_befund'])}")
 
     report["auffaelligkeiten"] = issues

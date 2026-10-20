@@ -8,3 +8,4 @@
 - Pro Tool-Aufruf eine DSM-Session mit Logout danach.
 - `DSM_TLS_SERVERNAME`: Verbindung per interner IP, Zertifikat wird trotzdem gegen den externen Namen geprüft.
 - `tls_check` zur Zertifikats-Diagnose, `DSM_TLS_FINGERPRINT` für Zertifikats-Pinning.
+- Auswertung gegen echte NAS korrigiert: Load richtig skaliert, Pool-Wert als zugewiesener Anteil, UNC-Sektorfehler werden gemeldet, Security Advisor listet die fehlgeschlagenen Regeln.

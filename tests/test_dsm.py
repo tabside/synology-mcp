@@ -173,7 +173,8 @@ def test_health_report_flags_issues(monkeypatch):
     monkeypatch.setattr(sm, "_storage", lambda c: {
         "pools": [{"id": "pool_1", "status": "degraded"}],
         "volumes": [{"pfad": "/volume1", "status": "normal", "belegt_prozent": 91.0}],
-        "disks": [{"name": "Disk 1", "status": "normal", "smart_status": "normal", "temperatur_c": 40},
+        "disks": [{"name": "Disk 1", "status": "normal", "smart_status": "normal", "temperatur_c": 40, "unc": 0},
+                  {"name": "Disk 3", "status": "normal", "smart_status": "normal", "temperatur_c": 35, "unc": 82},
                   {"name": "Disk 2", "status": "crashed", "smart_status": "failing", "temperatur_c": 58,
                    "restlebensdauer_prozent": 5}],
     })
@@ -189,7 +190,7 @@ def test_health_report_flags_issues(monkeypatch):
     text = "\n".join(r["auffaelligkeiten"])
     assert r["zustand"] == "pruefen"
     for expected in ("Temperatur-Warnung", "pool_1", "91.0 %", "Disk 2: Status crashed", "SMART failing",
-                     "58 °C", "Restlebensdauer 5 %", "Offsite", "Update", "security_advisor"):
+                     "58 °C", "Restlebensdauer 5 %", "Disk 3: 82 unkorrigierbare", "Offsite", "Update", "security_advisor"):
         assert expected in text
     assert "Disk 1" not in text and "Lokal" not in text
 
