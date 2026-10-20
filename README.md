@@ -43,6 +43,7 @@ Der Server ist **nur lesend**:
 | `DSM_USER` | ja | - | eigener User nur für den MCP |
 | `DSM_PASSWORD` | ja | - | |
 | `DSM_VERIFY_SSL` | nein | `true` | `true`, `false` oder Pfad zu einer CA-Datei |
+| `DSM_TLS_SERVERNAME` | nein | - | Name, auf den das DSM-Zertifikat ausgestellt ist, wenn `DSM_HOST` eine interne IP ist. Das Zertifikat wird dann gegen diesen Namen geprüft, statt die Prüfung abzuschalten |
 | `MCP_AUTH_TOKEN` | ja | - | Statisches Bearer-Token (mind. 24 Zeichen), ohne startet der Server nicht |
 | `MCP_VOLUME_WARN_PERCENT` | nein | `85` | Belegung, ab der ein Volume gemeldet wird |
 | `MCP_DISK_TEMP_WARN` | nein | `55` | Disk-Temperatur in °C, ab der gemeldet wird |
@@ -66,7 +67,7 @@ Der MCP selbst ruft nur lesende Methoden auf, die Rechte des Users begrenzen ihn
 Bei jedem Push auf `main` baut GitHub Actions das Image (`.github/workflows/docker-publish.yml`). Einmalig: Package-Sichtbarkeit auf GitHub auf **Public** stellen oder Portainer Zugang zur Registry geben.
 
 1. Portainer > Stacks > Add stack > Repository, Branch `main`, Compose-Pfad `docker-compose.yml`
-2. Environment variables setzen: `DSM_HOST`, `DSM_USER`, `DSM_PASSWORD`, `MCP_AUTH_TOKEN`, optional `DSM_PORT`, `DSM_VERIFY_SSL` und die Schwellwerte
+2. Environment variables setzen: `DSM_HOST`, `DSM_USER`, `DSM_PASSWORD`, `MCP_AUTH_TOKEN`, optional `DSM_PORT`, `DSM_VERIFY_SSL`, `DSM_TLS_SERVERNAME` und die Schwellwerte
 3. Deploy. Updates später per "Pull and redeploy".
 
 Reverse-Proxy mit TLS auf `<Host-IP>:8432`, Endpoint-Pfad `/mcp`. `GET /healthz` ist ohne Token erreichbar und liefert nur `{"status": "ok"}` (Docker-Healthcheck, keine Abfrage der NAS); alle anderen Pfade brauchen das Bearer-Token. In Claude als Remote-MCP mit `https://<subdomain>/mcp` und dem `MCP_AUTH_TOKEN` als Bearer-Token einbinden.

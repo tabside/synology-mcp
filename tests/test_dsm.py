@@ -32,7 +32,7 @@ class FakeHTTP:
         self.posts = []
         self.login_result = login_result or {"success": True, "data": {"sid": "SID", "synotoken": "TOK"}}
 
-    def post(self, url, data, headers):
+    def post(self, url, data, headers, extensions=None):
         self.posts.append((url, data, headers))
         if data["api"] == "SYNO.API.Info":
             return FakeResponse({"success": True, "data": {
@@ -200,3 +200,20 @@ def test_all_tools_registered_and_no_write_tools():
     names = {t.name for t in asyncio.run(sm.list_tools())}
     assert names == set(sm.TOOL_FUNCS)
     assert not any(t.name.startswith(("set", "delete", "create", "run")) for t in asyncio.run(sm.list_tools()))
+
+
+def test_tls_servername_sets_sni(monkeypatch):
+    seen = []
+
+    class H(FakeHTTP):
+        def post(self, url, data, headers, extensions=None):
+            seen.append(extensions)
+            return super().post(url, data, headers)
+
+    monkeypatch.setenv("DSM_TLS_SERVERNAME", "nas.example.com")
+    c = sm.DSMClient(H(), "https://192.0.2.10:5001/webapi")
+    c.login()
+    assert seen[-1] == {"sni_hostname": "nas.example.com"}
+    monkeypatch.delenv("DSM_TLS_SERVERNAME")
+    c.logout()
+    assert seen[-1] is None

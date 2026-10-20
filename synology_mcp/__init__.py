@@ -5,7 +5,7 @@ Läuft ausschliesslich als Docker-Container mit Streamable-HTTP-Transport hinter
 Reverse-Proxy und erfordert MCP_AUTH_TOKEN. Ein lokaler Betrieb (stdio/uvx) ist nicht vorgesehen.
 
 Alle Werte kommen aus Umgebungsvariablen (DSM_HOST, DSM_PORT, DSM_USER, DSM_PASSWORD,
-DSM_VERIFY_SSL, MCP_AUTH_TOKEN, MCP_HOST, MCP_PORT, Schwellwerte) - keine Secrets im Code.
+DSM_VERIFY_SSL, DSM_TLS_SERVERNAME, MCP_AUTH_TOKEN, MCP_HOST, MCP_PORT, Schwellwerte) - keine Secrets im Code.
 
 Der Server ist bewusst NUR LESEND:
 - Es gibt keine schreibenden Tools.
@@ -156,7 +156,10 @@ class DSMClient:
 
     def _post(self, path: str, data: dict) -> dict:
         headers = {"X-SYNO-TOKEN": self.token} if self.token else {}
-        resp = self.http.post(f"{self.base}/{path}", data=data, headers=headers)
+        # DSM_TLS_SERVERNAME: per IP verbinden, Zertifikat aber gegen den externen Namen prüfen (SNI)
+        servername = _env("DSM_TLS_SERVERNAME")
+        extensions = {"sni_hostname": servername} if servername else None
+        resp = self.http.post(f"{self.base}/{path}", data=data, headers=headers, extensions=extensions)
         resp.raise_for_status()
         return resp.json()
 
