@@ -688,7 +688,7 @@ def api_list(filter: str = None) -> list[dict]:
 
 # Generischer Lesezugriff: nur lesende Methoden, keine APIs mit Zugangsdaten oder Dateiinhalten.
 _READ_METHODS = {"list", "get", "info", "getinfo", "load_info", "status", "summary", "get_status",
-                 "system_get", "rule_get", "list_active", "query"}
+                 "system_get", "rule_get", "list_active", "query", "load", "get_sys_info"}
 _BLOCKED_API = re.compile(
     r"^SYNO\.API\.Auth|passw|passwd|secret|token|otp|key|cert|credential|encrypt|"
     r"^SYNO\.FileStation|^SYNO\.SynologyDrive\.(Files|Node)|^SYNO\.Foto|^SYNO\.Photo|"
@@ -770,7 +770,7 @@ async def list_tools():
         Tool(name="api_list", description="Verfügbare DSM-APIs mit Versionen, optional gefiltert (Hilfe für api_query).",
              inputSchema={"type": "object", "properties": {"filter": {"type": "string", "description": "Teil des API-Namens"}}}),
         Tool(name="api_query",
-             description="Lesender Aufruf einer beliebigen DSM-API für Fälle, die kein eigenes Tool haben. Nur lesende Methoden (list, get, info, load_info, status, summary usw.), APIs mit Zugangsdaten, Schlüsseln oder Benutzerdateien sind gesperrt.",
+             description="Lesender Aufruf einer beliebigen DSM-API für Fälle, die kein eigenes Tool haben. Nur lesende Methoden (list, get, info, load, load_info, status, summary usw.), APIs mit Zugangsdaten, Schlüsseln oder Benutzerdateien sind gesperrt.",
              inputSchema={"type": "object", "properties": {
                  "api": {"type": "string", "description": "z.B. SYNO.Core.Share"},
                  "method": {"type": "string", "description": "z.B. list"},
