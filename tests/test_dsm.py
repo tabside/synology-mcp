@@ -274,3 +274,91 @@ def test_pin_match_and_mismatch(monkeypatch):
 def test_no_pin_no_check(monkeypatch):
     monkeypatch.delenv("DSM_TLS_FINGERPRINT", raising=False)
     sm._check_pin(object())  # darf nichts anfassen
+
+
+# ---------------------------------------------------------------------------
+# cms_updates: Geräte im CMS mit Update-Information zusammenführen
+# ---------------------------------------------------------------------------
+
+class FakeCMSClient:
+    def __init__(self, has_cms=True):
+        self.calls = []
+        self.has_cms = has_cms
+
+    def has(self, api):
+        return self.has_cms
+
+    def call(self, api, method, version="max", _timeout=None, **params):
+        self.calls.append((api, method, params))
+        if api == "SYNO.CMS.DS":
+            extra = lambda u: json.dumps({"unique": u, "ip": "192.0.2.1"})
+            return {"total": 3, "ds_info_list": [
+                {"id": 1, "hostname": "nas-a", "additional": {"model": "DS1825+", "dsm_version": "DSM 7.4-90075",
+                                                              "status": 2, "extra_info": extra("synology_v1000nk_ds1825+")}},
+                {"id": 2, "hostname": "nas-b", "additional": {"model": "DS1825+", "dsm_version": "DSM 7.4-90075",
+                                                              "status": 2, "extra_info": extra("synology_v1000nk_ds1825+")}},
+                {"id": 3, "hostname": "nas-c", "additional": {"model": "DS218", "dsm_version": "DSM 6.2-25556 Update 8",
+                                                              "status": 10, "extra_info": extra("synology_rtd1296_ds218")}},
+            ]}
+        if api == "SYNO.Core.Upgrade.Group":
+            return {"result": [
+                {"unique": "synology_v1000nk_ds1825+", "current_version": "DSM 7.4-90075",
+                 "latest_version": "DSM 7.4.1-90080", "type": "dsm"},
+                {"unique": "synology_rtd1296_ds218", "current_version": "DSM 6.2-25556 Update 8",
+                 "latest_version": "DSM 6.2-25556 Update 8", "type": "dsm"},
+            ]}
+        raise AssertionError(api)
+
+
+def _fake_dsm(monkeypatch, client):
+    @contextmanager
+    def fake_dsm():
+        yield client
+    monkeypatch.setattr(sm, "dsm", fake_dsm)
+
+
+def test_cms_updates_merges_and_dedups(monkeypatch):
+    client = FakeCMSClient()
+    _fake_dsm(monkeypatch, client)
+    r = sm.cms_updates()
+    group_call = next(p for a, m, p in client.calls if a == "SYNO.Core.Upgrade.Group")
+    assert len(group_call["target"]) == 2  # gleiche Modell/Version-Kombination nur einmal angefragt
+    by_host = {g["hostname"]: g for g in r["geraete"]}
+    assert by_host["nas-a"]["update_verfuegbar"] and by_host["nas-a"]["neueste_version"] == "DSM 7.4.1-90080"
+    assert by_host["nas-c"]["update_verfuegbar"] is False and by_host["nas-c"]["status"] == "offline"
+    assert "hinweis" in by_host["nas-c"] and "hinweis" not in by_host["nas-a"]
+    assert r["zusammenfassung"] == {"geraete": 3, "online": 2, "update_verfuegbar": 2}
+    assert [g["hostname"] for g in r["geraete"]][:2] == ["nas-a", "nas-b"]
+
+
+def test_cms_updates_only_available(monkeypatch):
+    _fake_dsm(monkeypatch, FakeCMSClient())
+    r = sm.cms_updates(nur_verfuegbar=True)
+    assert {g["hostname"] for g in r["geraete"]} == {"nas-a", "nas-b"}
+
+
+def test_cms_updates_without_cms(monkeypatch):
+    _fake_dsm(monkeypatch, FakeCMSClient(has_cms=False))
+    assert "hinweis" in sm.cms_updates()
+
+
+def test_updates_uses_check_v3_params():
+    c, http = make_client()
+    sent = []
+    orig = http.post
+
+    def post(url, data, headers, extensions=None):
+        if data["api"] == "SYNO.API.Info":
+            return FakeResponse({"success": True, "data": {
+                "SYNO.Core.Upgrade.Server": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 4}}})
+        if data["api"] == "SYNO.Core.Upgrade.Server":
+            sent.append(data)
+            return FakeResponse({"success": True, "data": {"update": {"available": True, "version": "7.4.1"}}})
+        return orig(url, data, headers, extensions)
+
+    http.post = post
+    c.login()
+    r = sm._updates(c)
+    assert r["update_verfuegbar"] is True and r["version"] == "7.4.1"
+    assert sent[0]["method"] == "check" and sent[0]["version"] == "3"
+    assert sent[0]["need_auto_smallupdate"] == "true" and sent[0]["user_reading"] == "true"

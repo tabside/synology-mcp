@@ -185,13 +185,17 @@ class DSMClient:
         self.sid: str | None = None
         self.token: str | None = None
 
-    def _post(self, path: str, data: dict) -> dict:
+    def _post(self, path: str, data: dict, timeout: float | None = None) -> dict:
         headers = {"X-SYNO-TOKEN": self.token} if self.token else {}
         # DSM_TLS_SERVERNAME: per IP verbinden, Zertifikat aber gegen den externen Namen prüfen (SNI)
         servername = _env("DSM_TLS_SERVERNAME")
-        extensions = {"sni_hostname": servername} if servername else None
+        extensions = {"sni_hostname": servername} if servername else {}
+        if timeout:
+            # httpx-Timeout pro Request (z.B. Update-Abfrage beim Synology-Server, die länger dauert)
+            extensions["timeout"] = {"connect": timeout, "read": timeout, "write": timeout, "pool": timeout}
         # Als Stream, damit das Zertifikat der Verbindung gelesen werden kann, solange sie offen ist
-        with self.http.stream("POST", f"{self.base}/{path}", data=data, headers=headers, extensions=extensions) as resp:
+        with self.http.stream("POST", f"{self.base}/{path}", data=data, headers=headers,
+                              extensions=extensions or None) as resp:
             _check_pin(resp)
             resp.raise_for_status()
             resp.read()
@@ -242,7 +246,7 @@ class DSMClient:
     def has(self, api: str) -> bool:
         return api in self.api_info()
 
-    def call(self, api: str, method: str, version: str | int = "max", **params) -> Any:
+    def call(self, api: str, method: str, version: str | int = "max", _timeout: float | None = None, **params) -> Any:
         info = self.api_info().get(api)
         if not info:
             raise DSMError(api, method, 102)
@@ -257,7 +261,7 @@ class DSMClient:
             if v is None:
                 continue
             data[k] = json.dumps(v) if isinstance(v, (list, dict, bool)) else str(v)
-        res = self._post(info.get("path", "entry.cgi"), data)
+        res = self._post(info.get("path", "entry.cgi"), data, timeout=_timeout)
         if not res.get("success"):
             raise DSMError(api, method, res.get("error", {}).get("code", 100))
         return res.get("data", {})
@@ -510,7 +514,10 @@ def backup_tasks() -> list[dict]:
 
 
 def _updates(c: DSMClient) -> dict:
-    d = c.call("SYNO.Core.Upgrade.Server", "check")
+    # Gleicher Aufruf wie die Systemsteuerung (Version 3 mit diesen Parametern). Ohne sie
+    # antwortet DSM 7.4 mit Fehler 119. "check" fragt nur ab und lädt oder installiert nichts.
+    d = c.call("SYNO.Core.Upgrade.Server", "check", version=3, _timeout=120,
+               user_reading=True, need_auto_smallupdate=True, need_promotion=True)
     upd = d.get("update", d)
     return {"update_verfuegbar": upd.get("available"), "version": upd.get("version"),
             "neustart_noetig": upd.get("reboot"), "typ": upd.get("type")}
@@ -520,6 +527,91 @@ def updates() -> dict:
     """Prüft, ob ein DSM-Update verfügbar ist (installiert nichts)."""
     with dsm() as c:
         return _updates(c)
+
+
+# Statuscodes der Geräte im Central Management System (aus dem CMS-Webinterface)
+_CMS_STATUS = {
+    0: "unbekannt", 1: "nicht konfiguriert", 2: "online", 3: "nicht installiert", 4: "Update läuft",
+    5: "System verloren", 6: "startet", 7: "prüft Kontingent", 8: "startet Dienste",
+    9: "wartet auf Update", 10: "offline", 11: "tritt bei", 12: "tritt aus", 13: "Neustart",
+    14: "heruntergefahren", 15: "nicht erreichbar", 16: "Ruhezustand",
+}
+
+
+def _cms_devices(c: DSMClient) -> list[dict]:
+    """Alle Geräte im CMS mit Modell, DSM-Version, Status und Modellkennung (unique)."""
+    out, offset = [], 0
+    while True:
+        d = c.call("SYNO.CMS.DS", "list", version=1, offset=offset, limit=100,
+                   additional=["model", "dsm_version", "status", "extra_info", "gluster_role"])
+        items = d.get("ds_info_list", [])
+        for x in items:
+            a = x.get("additional") or {}
+            extra = a.get("extra_info") or {}
+            if isinstance(extra, str):
+                try:
+                    extra = json.loads(extra)
+                except ValueError:
+                    extra = {}
+            out.append({"id": x.get("id"), "hostname": x.get("hostname"), "modell": a.get("model"),
+                        "dsm_version": a.get("dsm_version"), "status_code": a.get("status"),
+                        "status": _CMS_STATUS.get(a.get("status"), f"Code {a.get('status')}"),
+                        "unique": extra.get("unique"), "gluster_role": a.get("gluster_role")})
+        offset += len(items)
+        if not items or offset >= int(d.get("total") or 0):
+            return out
+
+
+def _model_key(unique: str | None) -> str | None:
+    # unique = "synology_<plattform>_<modell>", das CMS vergleicht nur den Modellteil
+    parts = (unique or "").split("_")
+    return parts[2] if len(parts) > 2 else None
+
+
+def cms_updates(nur_verfuegbar: bool = False) -> dict:
+    """DSM-Updates aller Geräte im Central Management System (wie CMS > Update).
+    Fragt den Synology-Updateserver nur ab, lädt und installiert nichts."""
+    with dsm() as c:
+        if not c.has("SYNO.CMS.DS"):
+            return {"hinweis": "Central Management System ist auf dieser NAS nicht installiert oder nicht erreichbar"}
+        devices = _cms_devices(c)
+        seen, targets = set(), []
+        for dev in devices:
+            key = (dev["unique"], dev["dsm_version"])
+            if dev["unique"] and dev["dsm_version"] and key not in seen:
+                seen.add(key)
+                targets.append({"dsm_version": dev["dsm_version"], "unique": dev["unique"]})
+        infos = []
+        if targets:
+            # Wie im CMS-Webinterface: SYNO.Core.Upgrade.Group.info fragt pro Modell und Version
+            # beim Synology-Updateserver nach, das kann dauern
+            infos = c.call("SYNO.Core.Upgrade.Group", "info", version=1, _timeout=300,
+                           target=targets).get("result", [])
+
+    geraete = []
+    for dev in devices:
+        info = next((i for i in infos
+                     if _model_key(i.get("unique")) == _model_key(dev["unique"])
+                     and i.get("current_version") == dev["dsm_version"]), None)
+        latest = (info or {}).get("latest_version")
+        entry = {"hostname": dev["hostname"], "modell": dev["modell"], "status": dev["status"],
+                 "dsm_version": dev["dsm_version"], "neueste_version": latest,
+                 "update_verfuegbar": bool(latest) and latest != dev["dsm_version"] if info else None}
+        if dev["status_code"] != 2:
+            entry["hinweis"] = "Gerät nicht online, Update kann im CMS nicht verteilt werden"
+        if info is None:
+            entry["hinweis_update"] = "keine Update-Information vom Synology-Server erhalten"
+        geraete.append(entry)
+
+    geraete.sort(key=lambda g: (not g["update_verfuegbar"], (g["hostname"] or "").lower()))
+    zusammenfassung = {
+        "geraete": len(geraete),
+        "online": sum(1 for d in devices if d["status_code"] == 2),
+        "update_verfuegbar": sum(1 for g in geraete if g["update_verfuegbar"]),
+    }
+    if nur_verfuegbar:
+        geraete = [g for g in geraete if g["update_verfuegbar"]]
+    return {"zusammenfassung": zusammenfassung, "geraete": geraete}
 
 
 def packages() -> list[dict]:
@@ -723,6 +815,7 @@ TOOL_FUNCS = {
     "storage": storage,
     "backup_tasks": backup_tasks,
     "updates": updates,
+    "cms_updates": cms_updates,
     "packages": packages,
     "shares": shares,
     "connections": connections,
@@ -754,6 +847,11 @@ async def list_tools():
         Tool(name="storage", description="Speicherpools, Volumes mit Belegung und Disks mit Status, SMART, Temperatur und Restlebensdauer.", inputSchema=_EMPTY),
         Tool(name="backup_tasks", description="Hyper-Backup-Aufgaben mit letztem Ergebnis sowie letzter und nächster Ausführung.", inputSchema=_EMPTY),
         Tool(name="updates", description="Prüft, ob ein DSM-Update verfügbar ist. Installiert nichts.", inputSchema=_EMPTY),
+        Tool(name="cms_updates",
+             description="DSM-Updates aller Geräte im Central Management System (CMS): Hostname, Modell, Status (online/offline), installierte und neueste DSM-Version. Fragt nur ab, lädt und installiert nichts.",
+             inputSchema={"type": "object", "properties": {
+                 "nur_verfuegbar": {"type": "boolean", "default": False, "description": "Nur Geräte mit verfügbarem Update auflisten"},
+             }}),
         Tool(name="packages", description="Installierte Pakete mit Version und Status.", inputSchema=_EMPTY),
         Tool(name="shares", description="Freigegebene Ordner mit Volume, Verschlüsselung, Papierkorb und Kontingent.", inputSchema=_EMPTY),
         Tool(name="connections", description="Aktuell angemeldete Benutzer und Verbindungen.", inputSchema=_EMPTY),

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2
+
+- Neues Tool `cms_updates`: DSM-Updates aller Geräte im Central Management System (Hostname, Modell, Status, installierte und neueste Version), optional nur Geräte mit verfügbarem Update. Statuscodes des CMS werden als Text ausgegeben (z.B. 10 = offline).
+- `updates`: Abfrage wie die Systemsteuerung (SYNO.Core.Upgrade.Server.check Version 3 mit deren Parametern), vorher Fehler 119 unter DSM 7.4.
+- Längerer Timeout für Update-Abfragen beim Synology-Server.
+
 ## 0.1
 
 - Erste Version, nur lesend: System, Auslastung, Speicher (Pools, Volumes, Disks mit SMART), Hyper Backup, Updates, Pakete, Freigaben, Verbindungen, Log Center, Security Advisor, Synology Drive.

@@ -6,6 +6,7 @@ Der Server ist **nur lesend**:
 
 - es gibt keine schreibenden Tools (kein Neustart, keine Paket-, Freigabe- oder Backup-Aktionen)
 - `updates` prüft nur, ob ein Update verfügbar ist, und installiert nichts
+- `cms_updates` liest die Geräteliste des CMS und fragt beim Synology-Updateserver die neueste Version pro Modell ab, wie die Seite CMS > Update. Es wird nichts heruntergeladen oder verteilt. Ob ein Update als kritisch eingestuft ist, liefert diese Abfrage nicht
 - `security_advisor` liest das Ergebnis des letzten Scans und startet keinen neuen
 - `api_query` erlaubt nur lesende Methoden und sperrt APIs mit Zugangsdaten, Schlüsseln, Zertifikaten und Benutzerdateien (File Station, Drive-Dateien, Photos, Office, Mail usw.)
 - `drive_status` liefert nur Verbindungs- und Teamordner-Übersichten, keine Dateinamen oder Inhalte
@@ -22,6 +23,7 @@ Der Server ist **nur lesend**:
 | `storage` | Speicherpools (zugewiesener Anteil), Volumes mit Belegung, Disks mit Status, SMART, UNC-Fehler, Temperatur, Restlebensdauer |
 | `backup_tasks` | Hyper-Backup-Aufgaben mit letztem Ergebnis, letzter und nächster Ausführung |
 | `updates` | Ist ein DSM-Update verfügbar? |
+| `cms_updates` | DSM-Updates aller Geräte im Central Management System: Hostname, Modell, Status, installierte und neueste Version (optional nur Geräte mit Update) |
 | `packages` | Installierte Pakete mit Version und Status |
 | `shares` | Freigegebene Ordner mit Volume, Verschlüsselung, Papierkorb, Kontingent |
 | `connections` | Aktuell angemeldete Benutzer und Verbindungen |
