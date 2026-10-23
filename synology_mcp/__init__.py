@@ -104,7 +104,17 @@ def _base_url() -> str:
 
 # ---------------------------------------------------------------------------
 # Zertifikats-Pinning (DSM_TLS_FINGERPRINT = SHA-256 des Server-Zertifikats)
+#
+# Das Pinning greift im TLS-Handshake, nicht erst nach der Antwort: Das Zertifikat der NAS
+# wird einmal ohne Zugangsdaten geholt (reiner Handshake, keine Anwendungsdaten), mit dem
+# Fingerprint verglichen und dann als einzige Vertrauensbasis (CA) in den SSL-Kontext geladen.
+# Jede weitere Verbindung, auch der Login mit Passwort, scheitert damit bereits beim Handshake,
+# wenn die Gegenstelle ein anderes Zertifikat vorlegt - es gehen keine Daten an einen MITM.
 # ---------------------------------------------------------------------------
+
+_pinned_cert_cache: dict[str, str] = {}  # Fingerprint -> PEM (ein Fingerprint gehört zu genau einem Zertifikat)
+_pinned_cert_lock = threading.Lock()
+
 
 def _fingerprint_pin() -> str:
     return _env("DSM_TLS_FINGERPRINT").replace(":", "").replace(" ", "").lower()
@@ -119,7 +129,54 @@ def _fmt_fp(hexstr: str) -> str:
     return ":".join(hexstr[i:i + 2] for i in range(0, len(hexstr), 2)).upper()
 
 
+def _fetch_server_cert(host: str, port: int, servername: str) -> tuple[bytes, str]:
+    """Holt das Server-Zertifikat (DER) und die TLS-Version per reinem Handshake ohne Prüfung.
+    Es werden keine Anwendungsdaten gesendet, nur die ClientHello/SNI."""
+    import socket
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with socket.create_connection((host, port), timeout=10) as sock:
+        with ctx.wrap_socket(sock, server_hostname=servername) as tls:
+            return tls.getpeercert(binary_form=True), tls.version()
+
+
+def _pinned_pem() -> str:
+    """Zertifikat der NAS holen, gegen DSM_TLS_FINGERPRINT prüfen und als PEM liefern (gecacht pro Fingerprint)."""
+    import hmac
+    pin = _fingerprint_pin()
+    with _pinned_cert_lock:
+        pem = _pinned_cert_cache.get(pin)
+        if pem is None:
+            host, port = _env("DSM_HOST"), int(_env("DSM_PORT", "5001"))
+            if not host:
+                raise RuntimeError("DSM_HOST muss gesetzt sein (Umgebungsvariable)")
+            der, _ = _fetch_server_cert(host, port, _env("DSM_TLS_SERVERNAME") or host)
+            if not der:
+                raise RuntimeError("DSM_TLS_FINGERPRINT gesetzt, aber kein TLS-Zertifikat lesbar (DSM_HTTPS=false?)")
+            if not hmac.compare_digest(_sha256(der), pin):
+                raise RuntimeError(f"Zertifikat der NAS passt nicht zu DSM_TLS_FINGERPRINT (erhalten {_fmt_fp(_sha256(der))}) - Verbindung abgebrochen")
+            pem = ssl.DER_cert_to_PEM_cert(der)
+            _pinned_cert_cache[pin] = pem
+    return pem
+
+
+def _pinned_context() -> ssl.SSLContext:
+    """SSL-Kontext, der ausschliesslich dem gepinnten Zertifikat vertraut (CA-Pinning).
+    Hostname-Prüfung nur, wenn DSM_TLS_SERVERNAME gesetzt ist; sonst identifiziert der Fingerprint
+    das Zertifikat (selbstsignierte DSM-Zertifikate enthalten den Hostnamen oft nicht)."""
+    ctx = ssl.create_default_context(cadata=_pinned_pem())
+    # Das Blattzertifikat selbst ist der Vertrauensanker, keine Kette bis zu einer Root-CA nötig
+    ctx.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
+    ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.check_hostname = bool(_env("DSM_TLS_SERVERNAME"))
+    return ctx
+
+
 def _check_pin(resp) -> None:
+    """Zusätzliche Kontrolle nach dem Handshake: Das Zertifikat der tatsächlich genutzten Verbindung
+    muss dem Pin entsprechen. Der eigentliche Schutz ist der Kontext aus _pinned_context()."""
     pin = _fingerprint_pin()
     if not pin:
         return
@@ -201,16 +258,6 @@ class DSMClient:
             resp.read()
         return resp.json()
 
-    def preflight(self) -> None:
-        """Erster Request ohne Zugangsdaten. Bei Pinning wird das Zertifikat dieser Verbindung
-        geprüft, bevor das Passwort gesendet wird (Pool mit nur einer Verbindung)."""
-        servername = _env("DSM_TLS_SERVERNAME")
-        with self.http.stream("GET", f"{self.base}/query.cgi",
-                              params={"api": "SYNO.API.Info", "version": "1", "method": "query", "query": "SYNO.API.Auth"},
-                              extensions={"sni_hostname": servername} if servername else None) as resp:
-            _check_pin(resp)
-            resp.read()
-
     def api_info(self) -> dict[str, dict]:
         with _api_info_lock:
             if not _api_info_cache:
@@ -270,14 +317,12 @@ class DSMClient:
 @contextmanager
 def dsm():
     import httpx
-    pinned = bool(_fingerprint_pin())
-    # Bei Pinning ersetzt der Fingerprint-Vergleich die CA-Prüfung (z.B. selbstsigniertes DSM-Zertifikat im LAN)
-    verify = False if pinned else _verify()
+    # Bei Pinning ersetzt das gepinnte Zertifikat die CA-Prüfung (z.B. selbstsigniertes DSM-Zertifikat im LAN);
+    # die Prüfung passiert im Handshake, bevor Login-Daten gesendet werden
+    verify = _pinned_context() if _fingerprint_pin() else _verify()
     limits = httpx.Limits(max_connections=1, max_keepalive_connections=1)
     with httpx.Client(verify=verify, timeout=30, limits=limits, trust_env=False) as http:
         client = DSMClient(http, _base_url())
-        if pinned:
-            client.preflight()
         client.login()
         try:
             yield client
@@ -354,13 +399,7 @@ def tls_check() -> dict:
     if not host:
         raise RuntimeError("DSM_HOST muss gesetzt sein (Umgebungsvariable)")
     servername = _env("DSM_TLS_SERVERNAME") or host
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    with socket.create_connection((host, port), timeout=10) as sock:
-        with ctx.wrap_socket(sock, server_hostname=servername) as tls:
-            der = tls.getpeercert(binary_form=True)
-            tls_version = tls.version()
+    der, tls_version = _fetch_server_cert(host, port, servername)
     out = {"verbindung": f"{host}:{port}", "sni": servername, "tls": tls_version, **_decode_der(der),
            "sha256": _fmt_fp(_sha256(der))}
     try:
@@ -784,7 +823,12 @@ _READ_METHODS = {"list", "get", "info", "getinfo", "load_info", "status", "summa
 _BLOCKED_API = re.compile(
     r"^SYNO\.API\.Auth|passw|passwd|secret|token|otp|key|cert|credential|encrypt|"
     r"^SYNO\.FileStation|^SYNO\.SynologyDrive\.(Files|Node)|^SYNO\.Foto|^SYNO\.Photo|"
-    r"^SYNO\.Office|^SYNO\.Note|^SYNO\.Mail|^SYNO\.Chat|^SYNO\.Contacts|^SYNO\.Cal\b|^SYNO\.Calendar",
+    r"^SYNO\.Office|^SYNO\.Note|^SYNO\.Mail|^SYNO\.Chat|^SYNO\.Contacts|^SYNO\.Cal\b|^SYNO\.Calendar|"
+    # Lesend, aber mit Konfigurationsdaten, die Zugangsdaten oder Zugriffsrechte enthalten können:
+    # Aufgabenplaner (Skripte), VPN/PPPoE, DDNS-Konten, Backup-Ziele, Benutzer, Freigabe-Rechte,
+    # Sicherheitseinstellungen (Firewall, Auto-Block), Syslog-Client
+    r"^SYNO\.Core\.TaskScheduler|^SYNO\.Core\.Network\.(VPN|PPPoE)|^SYNO\.Core\.DDNS|^SYNO\.Backup\.Target|"
+    r"^SYNO\.Core\.User|^SYNO\.Core\.Share\.Permission|^SYNO\.Core\.Security\.|^SYNO\.Core\.SyslogClient(?!\.Log\b)",
     re.IGNORECASE,
 )
 
@@ -901,6 +945,7 @@ async def call_tool(name, arguments):
 # ---------------------------------------------------------------------------
 
 MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
+MCP_AUTH_TOKEN_MIN_LENGTH = 32
 
 
 class _StreamableHTTPASGIApp:
@@ -982,9 +1027,9 @@ async def run_http_server():
 
 
 def main():
-    if len(MCP_AUTH_TOKEN) < 24:
+    if len(MCP_AUTH_TOKEN) < MCP_AUTH_TOKEN_MIN_LENGTH:
         raise RuntimeError(
-            "MCP_AUTH_TOKEN fehlt oder ist zu kurz (mind. 24 Zeichen) - aus Sicherheitsgründen kein Start."
+            f"MCP_AUTH_TOKEN fehlt oder ist zu kurz (mind. {MCP_AUTH_TOKEN_MIN_LENGTH} Zeichen) - aus Sicherheitsgründen kein Start."
         )
     asyncio.run(run_http_server())
 

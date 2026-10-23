@@ -21,5 +21,6 @@ services:
       - MCP_HOST=0.0.0.0
       - MCP_PORT=8000
     ports:
-      # Zugriffskontrolle ist das Bearer-Token, TLS macht der Reverse-Proxy. Über MCP_BIND_ADDR einschränkbar.
-      - "${MCP_BIND_ADDR:-0.0.0.0}:${MCP_HOST_PORT:-8432}:8000"
+      # Zugriffskontrolle ist das Bearer-Token, TLS macht der Reverse-Proxy. Standardmässig nur auf localhost
+      # gemappt; für einen Reverse-Proxy auf einem anderen Host MCP_BIND_ADDR auf die LAN-IP setzen.
+      - "${MCP_BIND_ADDR:-127.0.0.1}:${MCP_HOST_PORT:-8432}:8000"

@@ -135,10 +135,24 @@ def test_api_query_blocks_write_methods(method):
 
 @pytest.mark.parametrize("api", ["SYNO.API.Auth", "SYNO.Core.Certificate", "SYNO.FileStation.List",
                                  "SYNO.SynologyDrive.Files", "SYNO.Core.OTP", "SYNO.Core.User.PasswordPolicy",
-                                 "SYNO.Foto.Browse.Item"])
+                                 "SYNO.Foto.Browse.Item",
+                                 # lesend, aber Konfiguration mit Zugangsdaten/Rechten
+                                 "SYNO.Core.TaskScheduler", "SYNO.Core.TaskScheduler.Root",
+                                 "SYNO.Core.Network.VPN.OpenVPN", "SYNO.Core.Network.PPPoE",
+                                 "SYNO.Core.DDNS.Record", "SYNO.Backup.Target", "SYNO.Core.User",
+                                 "SYNO.Core.User.Group", "SYNO.Core.Share.Permission",
+                                 "SYNO.Core.Security.Firewall", "SYNO.Core.Security.AutoBlock",
+                                 "SYNO.Core.SyslogClient.Setting"])
 def test_api_query_blocks_sensitive_apis(api):
     with pytest.raises(RuntimeError, match="gesperrt"):
         sm.api_query(api, "list")
+
+
+@pytest.mark.parametrize("api", ["SYNO.Core.Share", "SYNO.Core.System", "SYNO.Core.SyslogClient.Log",
+                                 "SYNO.Core.SecurityScan.Status", "SYNO.Core.Network", "SYNO.Backup.Task",
+                                 "SYNO.Core.Upgrade.Server"])
+def test_api_query_allows_plain_read_apis(api):
+    sm._check_query_allowed(api, "list")  # darf nicht werfen
 
 
 def test_api_query_strips_reserved_params(monkeypatch):

@@ -8,7 +8,7 @@ Der Server ist **nur lesend**:
 - `updates` prüft nur, ob ein Update verfügbar ist, und installiert nichts
 - `cms_updates` liest die Geräteliste des CMS und fragt beim Synology-Updateserver die neueste Version pro Modell ab, wie die Seite CMS > Update. Es wird nichts heruntergeladen oder verteilt. Ob ein Update als kritisch eingestuft ist, liefert diese Abfrage nicht
 - `security_advisor` liest das Ergebnis des letzten Scans und startet keinen neuen
-- `api_query` erlaubt nur lesende Methoden und sperrt APIs mit Zugangsdaten, Schlüsseln, Zertifikaten und Benutzerdateien (File Station, Drive-Dateien, Photos, Office, Mail usw.)
+- `api_query` erlaubt nur lesende Methoden und sperrt APIs mit Zugangsdaten, Schlüsseln, Zertifikaten und Benutzerdateien (File Station, Drive-Dateien, Photos, Office, Mail usw.) sowie lesende APIs, deren Konfiguration Zugangsdaten oder Zugriffsrechte enthalten kann (Aufgabenplaner, VPN/PPPoE, DDNS, Backup-Ziele, Benutzer, Freigabe-Rechte, Firewall/Auto-Block, Syslog-Client)
 - `drive_status` liefert nur Verbindungs- und Teamordner-Übersichten, keine Dateinamen oder Inhalte
 - jeder Tool-Aufruf meldet sich an der NAS an und danach wieder ab, es bleiben keine Sessions offen
 
@@ -47,13 +47,13 @@ Der Server ist **nur lesend**:
 | `DSM_PASSWORD` | ja | - | |
 | `DSM_VERIFY_SSL` | nein | `true` | `true`, `false` oder Pfad zu einer CA-Datei |
 | `DSM_TLS_SERVERNAME` | nein | - | Name, auf den das DSM-Zertifikat ausgestellt ist, wenn `DSM_HOST` eine interne IP ist. Das Zertifikat wird dann gegen diesen Namen geprüft, statt die Prüfung abzuschalten |
-| `DSM_TLS_FINGERPRINT` | nein | - | SHA-256 des DSM-Zertifikats (mit oder ohne Doppelpunkte, siehe `tls_check`). Ersetzt die CA-Prüfung, z.B. bei selbstsigniertem Zertifikat im LAN. Vor dem Login wird ein Request ohne Zugangsdaten gemacht und das Zertifikat geprüft, erst danach geht das Passwort über dieselbe Verbindung |
-| `MCP_AUTH_TOKEN` | ja | - | Statisches Bearer-Token (mind. 24 Zeichen), ohne startet der Server nicht |
+| `DSM_TLS_FINGERPRINT` | nein | - | SHA-256 des DSM-Zertifikats (mit oder ohne Doppelpunkte, siehe `tls_check`). Ersetzt die CA-Prüfung, z.B. bei selbstsigniertem Zertifikat im LAN. Das Zertifikat wird einmal per reinem TLS-Handshake (ohne Zugangsdaten) geholt, mit dem Fingerprint verglichen und dann als einzige Vertrauensbasis geladen. Jede Verbindung, auch der Login, scheitert bei einem anderen Zertifikat bereits im Handshake, bevor Daten gesendet werden. Ist zusätzlich `DSM_TLS_SERVERNAME` gesetzt, wird auch der Name im Zertifikat geprüft |
+| `MCP_AUTH_TOKEN` | ja | - | Statisches Bearer-Token (mind. 32 Zeichen), ohne startet der Server nicht |
 | `MCP_VOLUME_WARN_PERCENT` | nein | `85` | Belegung, ab der ein Volume gemeldet wird |
 | `MCP_DISK_TEMP_WARN` | nein | `55` | Disk-Temperatur in °C, ab der gemeldet wird |
 | `MCP_DISK_LIFE_WARN_PERCENT` | nein | `20` | Restlebensdauer (SSD), ab der gemeldet wird |
 | `MCP_HOST` / `MCP_PORT` | nein | `0.0.0.0` / `8000` | Bind im Container |
-| `MCP_BIND_ADDR` / `MCP_HOST_PORT` | nein | `0.0.0.0` / `8432` | Port-Mapping auf dem Docker-Host |
+| `MCP_BIND_ADDR` / `MCP_HOST_PORT` | nein | `127.0.0.1` / `8432` | Port-Mapping auf dem Docker-Host. Standard nur localhost; läuft der Reverse-Proxy auf einem anderen Host, die LAN-IP des Docker-Hosts setzen |
 
 ## 1. User auf der NAS anlegen
 
@@ -74,7 +74,7 @@ Bei jedem Push auf `main` baut GitHub Actions das Image (`.github/workflows/dock
 2. Environment variables setzen: `DSM_HOST`, `DSM_USER`, `DSM_PASSWORD`, `MCP_AUTH_TOKEN`, optional `DSM_PORT`, `DSM_VERIFY_SSL`, `DSM_TLS_SERVERNAME`, `DSM_TLS_FINGERPRINT` und die Schwellwerte
 3. Deploy. Updates später per "Pull and redeploy".
 
-Reverse-Proxy mit TLS auf `<Host-IP>:8432`, Endpoint-Pfad `/mcp`. `GET /healthz` ist ohne Token erreichbar und liefert nur `{"status": "ok"}` (Docker-Healthcheck, keine Abfrage der NAS); alle anderen Pfade brauchen das Bearer-Token. In Claude als Remote-MCP mit `https://<subdomain>/mcp` und dem `MCP_AUTH_TOKEN` als Bearer-Token einbinden.
+Reverse-Proxy mit TLS auf `<Host-IP>:8432`, Endpoint-Pfad `/mcp`. Der Port ist standardmässig nur auf `127.0.0.1` des Docker-Hosts gemappt; läuft der Proxy auf einem anderen Host, `MCP_BIND_ADDR` auf die LAN-IP setzen. `GET /healthz` ist ohne Token erreichbar und liefert nur `{"status": "ok"}` (Docker-Healthcheck, keine Abfrage der NAS); alle anderen Pfade brauchen das Bearer-Token. In Claude als Remote-MCP mit `https://<subdomain>/mcp` und dem `MCP_AUTH_TOKEN` als Bearer-Token einbinden.
 
 Der Container läuft als unprivilegierter User.
 
@@ -85,4 +85,4 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-Die Unit-Tests prüfen Bearer-Auth, `/healthz`, den DSM-Client (Login, Versionen, Fehlercodes, Logout), die Sperren von `api_query` und die Auswertung im `health_report` mit Fake-Objekten, ohne NAS.
+Die Unit-Tests prüfen Bearer-Auth, `/healthz`, den DSM-Client (Login, Versionen, Fehlercodes, Logout), die Sperren von `api_query` und die Auswertung im `health_report` mit Fake-Objekten, ohne NAS. Das Zertifikats-Pinning wird gegen einen lokalen HTTPS-Server mit selbstsigniertem Zertifikat geprüft (dafür `cryptography` in `requirements-dev.txt`), inklusive des Falls, dass die Gegenstelle nach dem Holen des Zertifikats ein anderes vorlegt.

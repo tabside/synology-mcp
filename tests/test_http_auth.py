@@ -59,3 +59,18 @@ def test_other_paths_still_need_token(http_client, path):
 def test_healthz_only_get(http_client):
     assert http_client.post("/healthz").status_code == 401
 
+
+@pytest.mark.parametrize("token", ["", "kurz", "a" * 31])
+def test_main_refuses_short_token(monkeypatch, token):
+    monkeypatch.setattr(sm, "MCP_AUTH_TOKEN", token)
+    with pytest.raises(RuntimeError, match="mind. 32 Zeichen"):
+        sm.main()
+
+
+def test_main_accepts_32_char_token(monkeypatch):
+    monkeypatch.setattr(sm, "MCP_AUTH_TOKEN", "a" * 32)
+    started = []
+    monkeypatch.setattr(sm.asyncio, "run", lambda coro: (started.append(coro), coro.close()))
+    sm.main()
+    assert started
+

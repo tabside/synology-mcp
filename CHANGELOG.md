@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3
+
+- Zertifikats-Pinning (`DSM_TLS_FINGERPRINT`) greift jetzt im TLS-Handshake statt erst nach der Antwort: Das DSM-Zertifikat wird einmal ohne Zugangsdaten geholt, mit dem Fingerprint verglichen und als einzige Vertrauensbasis in den SSL-Kontext geladen. Vorher wurde mit `verify=False` verbunden und das Zertifikat erst nach dem Response verglichen, der Login mit Passwort konnte so auf einer neuen Verbindung an eine falsche Gegenstelle gehen. Mit `DSM_TLS_SERVERNAME` wird zusätzlich der Name geprüft. Der separate Preflight-Request entfällt.
+- `api_query`: Sperre um lesende APIs erweitert, deren Konfiguration Zugangsdaten oder Zugriffsrechte enthalten kann (`SYNO.Core.TaskScheduler`, `SYNO.Core.Network.VPN`/`PPPoE`, `SYNO.Core.DDNS`, `SYNO.Backup.Target`, `SYNO.Core.User`, `SYNO.Core.Share.Permission`, `SYNO.Core.Security.*`, `SYNO.Core.SyslogClient` ausser `.Log`).
+- `MCP_AUTH_TOKEN` muss mindestens 32 Zeichen lang sein (vorher 24).
+- Compose: Host-Port standardmässig nur auf `127.0.0.1` gemappt (`MCP_BIND_ADDR`), vorher `0.0.0.0`.
+- Abhängigkeiten exakt gepinnt; `cryptography` nur für die Tests.
+- Tests für Pinning gegen lokalen HTTPS-Server (korrekter Pin, falscher Pin, gewechseltes Zertifikat, Hostname-Prüfung) und für die erweiterte Sperrliste.
+
 ## 0.2
 
 - Neues Tool `cms_updates`: DSM-Updates aller Geräte im Central Management System (Hostname, Modell, Status, installierte und neueste Version), optional nur Geräte mit verfügbarem Update. Statuscodes des CMS werden als Text ausgegeben (z.B. 10 = offline).
