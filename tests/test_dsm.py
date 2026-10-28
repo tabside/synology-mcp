@@ -416,6 +416,7 @@ class FakeUpdateClient:
                 for t in params["target"]]}
         if api == "SYNO.CMS.PolicyEditor.Patch":
             out = []
+            assert len(params["files"]) == 1  # pro Datei ein Aufruf
             for f in params["files"]:
                 path = f["path"]
                 m = {"DS1825+": "synology_v1000nk_ds1825+", "RS820+": "synology_denverton_rs820+",
@@ -425,7 +426,7 @@ class FakeUpdateClient:
                     ver = "7.0.1-42218" if "DS216j" in path else "7.4-90080"
                     out.append({"path": path, "success": True, "exist": True, "model": model, "version": ver})
                 else:
-                    out.append({"path": path, "success": False, "exist": False})
+                    raise sm.DSMError(api, method, 101)  # wie das echte CMS bei fehlender Datei
             return {"filestat": out}
         if api == "SYNO.CMS.Task" and method == "create":
             return {"task_id": 2, "task_uuid": "UUID-2"}

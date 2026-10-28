@@ -689,11 +689,21 @@ def _patch_candidates(dev: dict, build: int, patch_dir: str) -> list[str]:
 
 
 def _patch_info(c: DSMClient, paths: list[str]) -> dict[str, dict]:
-    if not paths:
-        return {}
-    res = c.call("SYNO.CMS.PolicyEditor.Patch", "info", version=2, _timeout=120,
-                 files=[{"path": p, "isdir": False} for p in paths])
-    return {f.get("path"): f for f in res.get("filestat", [])}
+    """Prüft .pat-Dateien einzeln: Das CMS beantwortet einen Aufruf mit einer nicht vorhandenen
+    Datei komplett mit Fehler 101, darum pro Datei ein Aufruf; 101 = Datei fehlt."""
+    out = {}
+    for p in paths:
+        try:
+            res = c.call("SYNO.CMS.PolicyEditor.Patch", "info", version=2, _timeout=120,
+                         files=[{"path": p, "isdir": False}])
+        except DSMError as e:
+            if e.code == 101:
+                out[p] = {"path": p, "success": False, "exist": False}
+                continue
+            raise
+        for f in res.get("filestat", []):
+            out[f.get("path")] = f
+    return out
 
 
 def _parse_schedule(schedule: str | None) -> dict | None:
