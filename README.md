@@ -2,9 +2,9 @@
 
 MCP-Server für eine Synology-NAS mit DSM 7, über die DSM Web API. Zustand, Auslastung, Speicherpools, Volumes, Disks (SMART, Temperatur, Restlebensdauer), Hyper-Backup-Aufgaben, Updates, Pakete, freigegebene Ordner, Verbindungen, Log Center, Security Advisor und Synology Drive lesen, dazu ein zusammenfassender Zustandsbericht. Gleicher Aufbau wie esxi-mcp und pbs-mcp: läuft ausschliesslich als Docker-Container (Streamable HTTP) hinter einem Reverse-Proxy, Schutz per statischem Bearer-Token (`MCP_AUTH_TOKEN`), Image per GitHub Actions nach ghcr.io.
 
-Der Server ist **nur lesend**:
+Der Server ist **grundsätzlich lesend**:
 
-- es gibt keine schreibenden Tools (kein Neustart, keine Paket-, Freigabe- oder Backup-Aktionen)
+- einziges schreibendes Tool ist `cms_dsm_update` (DSM-Update über das CMS verteilen, siehe unten). Ohne `confirm=true` liefert es nur eine Vorschau, ausgeführt wird nur mit `MCP_ALLOW_WRITE=true` im Container. Sonst gibt es keine schreibenden Tools (kein Neustart, keine Paket-, Freigabe- oder Backup-Aktionen)
 - `updates` prüft nur, ob ein Update verfügbar ist, und installiert nichts
 - `cms_updates` liest die Geräteliste des CMS und fragt beim Synology-Updateserver die neueste Version pro Modell ab, wie die Seite CMS > Update. Es wird nichts heruntergeladen oder verteilt. Ob ein Update als kritisch eingestuft ist, liefert diese Abfrage nicht
 - `security_advisor` liest das Ergebnis des letzten Scans und startet keinen neuen
@@ -24,6 +24,8 @@ Der Server ist **nur lesend**:
 | `backup_tasks` | Hyper-Backup-Aufgaben mit letztem Ergebnis, letzter und nächster Ausführung |
 | `updates` | Ist ein DSM-Update verfügbar? |
 | `cms_updates` | DSM-Updates aller Geräte im Central Management System: Hostname, Modell, Status, installierte und neueste Version (optional nur Geräte mit Update) |
+| `cms_dsm_update` | DSM-Update über das CMS an ausgewählte Geräte verteilen (Vorschau ohne `confirm`, siehe unten) |
+| `cms_tasks` | CMS-Aufgaben auflisten, mit `task_uuid` Status, Schritt und Fehler pro Gerät |
 | `packages` | Installierte Pakete mit Version und Status |
 | `shares` | Freigegebene Ordner mit Volume, Verschlüsselung, Papierkorb, Kontingent |
 | `connections` | Aktuell angemeldete Benutzer und Verbindungen |
@@ -35,6 +37,18 @@ Der Server ist **nur lesend**:
 | `api_query` | Lesender Aufruf einer beliebigen DSM-API für Fälle ohne eigenes Tool |
 
 `health_report` meldet als Auffälligkeit: Temperatur-Warnung des Systems, Pools/Volumes/Disks mit Status ungleich `normal`, SMART ungleich `normal`, unkorrigierbare Sektorfehler (UNC), Volumes ab `MCP_VOLUME_WARN_PERCENT`, Disks ab `MCP_DISK_TEMP_WARN` °C, überschrittene Grenze für fehlerhafte Sektoren, Restlebensdauer unter der DSM-Grenze oder unter `MCP_DISK_LIFE_WARN_PERCENT`, Backups mit fehlgeschlagenem letzten Ergebnis, verfügbare Updates und Befunde des Security Advisors. Teile, die nicht gelesen werden können, erscheinen ebenfalls als Auffälligkeit.
+
+## DSM-Update über das CMS (`cms_dsm_update`)
+
+Gleicher Ablauf wie im CMS unter Aufgabe > DSM-Aktualisierung: Das CMS legt eine Aufgabe `dsm_update` an, überträgt die `.pat`-Datei auf die Zielgeräte und startet dort das Update. **Die Geräte starten dabei neu.**
+
+- Die `.pat`-Dateien müssen bereits auf der CMS-NAS liegen (z.B. im CMS-Update-Assistenten heruntergeladen oder von Synology geladen). Gesucht wird pro Gerät in `patch_dir` bzw. `CMS_PATCH_DIR` nach `DSM_<Modell>_<Build>.pat` (Build der neuesten Version laut Synology-Server), alternativ pro Gerät über `patch_files` angeben. Jede Datei wird vorher über das CMS geprüft (Modell, Build)
+- abgelehnt werden: Geräte, die nicht online sind, die CMS-NAS selbst, Patches für ein anderes Modell, nicht neuere Builds und Major-Upgrades (z.B. DSM 6 -> 7, nur mit `allow_major=true`)
+- `schedule` (`YYYY-MM-DD HH:MM`, Zeitzone der CMS-NAS) plant die Aufgabe, leer = sofort
+- ohne `confirm=true` nur Vorschau; mit `confirm=true` nur, wenn `MCP_ALLOW_WRITE=true` gesetzt ist
+- Fortschritt mit `cms_tasks`
+
+Der MCP-User auf der CMS-NAS braucht dafür dieselben Rechte wie bisher (Gruppe `administrators`).
 
 ## Umgebungsvariablen
 
@@ -48,6 +62,8 @@ Der Server ist **nur lesend**:
 | `DSM_VERIFY_SSL` | nein | `true` | `true`, `false` oder Pfad zu einer CA-Datei |
 | `DSM_TLS_SERVERNAME` | nein | - | Name, auf den das DSM-Zertifikat ausgestellt ist, wenn `DSM_HOST` eine interne IP ist. Das Zertifikat wird dann gegen diesen Namen geprüft, statt die Prüfung abzuschalten |
 | `DSM_TLS_FINGERPRINT` | nein | - | SHA-256 des DSM-Zertifikats (mit oder ohne Doppelpunkte, siehe `tls_check`). Ersetzt die CA-Prüfung, z.B. bei selbstsigniertem Zertifikat im LAN. Das Zertifikat wird einmal per reinem TLS-Handshake (ohne Zugangsdaten) geholt, mit dem Fingerprint verglichen und dann als einzige Vertrauensbasis geladen. Jede Verbindung, auch der Login, scheitert bei einem anderen Zertifikat bereits im Handshake, bevor Daten gesendet werden. Ist zusätzlich `DSM_TLS_SERVERNAME` gesetzt, wird auch der Name im Zertifikat geprüft |
+| `MCP_ALLOW_WRITE` | nein | `false` | `true` erlaubt `cms_dsm_update` mit `confirm=true`. Ohne gibt es nur die Vorschau |
+| `CMS_PATCH_DIR` | nein | - | Ordner auf der CMS-NAS mit den `.pat`-Dateien (z.B. `/volume1/patches`), Dateinamen `DSM_<Modell>_<Build>.pat` |
 | `MCP_AUTH_TOKEN` | ja | - | Statisches Bearer-Token (mind. 32 Zeichen), ohne startet der Server nicht |
 | `MCP_VOLUME_WARN_PERCENT` | nein | `85` | Belegung, ab der ein Volume gemeldet wird |
 | `MCP_DISK_TEMP_WARN` | nein | `55` | Disk-Temperatur in °C, ab der gemeldet wird |

@@ -2,8 +2,8 @@
 name = "synology-mcp"
 # Nur Major.Minor wird von Hand gepflegt, der Patch-Teil wird automatisch
 # aus der Git-Historie gezaehlt (siehe _read_version im Paket).
-version = "0.3.0"
-description = "MCP-Server fuer eine Synology-NAS (DSM 7): Zustand, Speicher, Disks, Backups, Updates und Logs lesen und berichten, nur lesend"
+version = "0.4.0"
+description = "MCP-Server fuer eine Synology-NAS (DSM 7): Zustand, Speicher, Disks, Backups, Updates und Logs lesen und berichten, DSM-Updates ueber das CMS verteilen"
 requires-python = ">=3.12"
 dependencies = [
     "uvicorn==0.54.0",

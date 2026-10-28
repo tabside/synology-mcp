@@ -7,8 +7,9 @@ Reverse-Proxy und erfordert MCP_AUTH_TOKEN. Ein lokaler Betrieb (stdio/uvx) ist 
 Alle Werte kommen aus Umgebungsvariablen (DSM_HOST, DSM_PORT, DSM_USER, DSM_PASSWORD,
 DSM_VERIFY_SSL, DSM_TLS_SERVERNAME, DSM_TLS_FINGERPRINT, MCP_AUTH_TOKEN, MCP_HOST, MCP_PORT, Schwellwerte) - keine Secrets im Code.
 
-Der Server ist bewusst NUR LESEND:
-- Es gibt keine schreibenden Tools.
+Der Server ist grundsätzlich LESEND:
+- Einzige Ausnahme ist cms_dsm_update (DSM-Update über das CMS verteilen): ohne confirm=true nur
+  Vorschau, ausgeführt wird nur mit MCP_ALLOW_WRITE=true im Container.
 - api_query (generischer Lesezugriff) lässt nur lesende Methoden zu (Allowlist) und sperrt
   APIs mit Zugangsdaten, Schlüsseln oder Dateiinhalten (Blocklist).
 - Jeder Tool-Aufruf meldet sich an und danach wieder ab, es bleiben keine Sessions offen.
@@ -582,7 +583,8 @@ def _cms_devices(c: DSMClient) -> list[dict]:
     out, offset = [], 0
     while True:
         d = c.call("SYNO.CMS.DS", "list", version=1, offset=offset, limit=100,
-                   additional=["model", "dsm_version", "status", "extra_info", "gluster_role"])
+                   additional=["model", "dsm_version", "status", "extra_info", "gluster_role",
+                               "host", "http_port", "build_number", "smallfix_number"])
         items = d.get("ds_info_list", [])
         for x in items:
             a = x.get("additional") or {}
@@ -595,7 +597,9 @@ def _cms_devices(c: DSMClient) -> list[dict]:
             out.append({"id": x.get("id"), "hostname": x.get("hostname"), "modell": a.get("model"),
                         "dsm_version": a.get("dsm_version"), "status_code": a.get("status"),
                         "status": _CMS_STATUS.get(a.get("status"), f"Code {a.get('status')}"),
-                        "unique": extra.get("unique"), "gluster_role": a.get("gluster_role")})
+                        "unique": extra.get("unique"), "gluster_role": a.get("gluster_role"),
+                        "host": a.get("host"), "http_port": a.get("http_port"),
+                        "build_number": a.get("build_number"), "self": bool(extra.get("self"))})
         offset += len(items)
         if not items or offset >= int(d.get("total") or 0):
             return out
@@ -651,6 +655,193 @@ def cms_updates(nur_verfuegbar: bool = False) -> dict:
     if nur_verfuegbar:
         geraete = [g for g in geraete if g["update_verfuegbar"]]
     return {"zusammenfassung": zusammenfassung, "geraete": geraete}
+
+
+# ---------------------------------------------------------------------------
+# CMS: DSM-Update an verwaltete Geräte verteilen (einziges schreibendes Tool)
+#
+# Gleicher Ablauf wie CMS > Aufgabe > DSM-Aktualisierung im Webinterface: Das CMS legt eine
+# Aufgabe "dsm_update" an, lädt die .pat-Datei auf die Zielgeräte und startet dort das Update
+# (mit Neustart). Die .pat-Dateien müssen bereits auf der CMS-NAS liegen.
+# Schutz: ohne confirm=true nur Vorschau; ausgeführt wird nur, wenn MCP_ALLOW_WRITE=true gesetzt ist;
+# offline-Geräte, die CMS-NAS selbst, ältere/gleiche Builds und Major-Sprünge (z.B. 6.x -> 7.x,
+# nur mit allow_major=true) werden abgelehnt.
+# ---------------------------------------------------------------------------
+
+def _write_allowed() -> bool:
+    return _env("MCP_ALLOW_WRITE", "false").lower() == "true"
+
+
+def _parse_dsm(v: str | None) -> dict | None:
+    """'DSM 7.4.1-90080 Update 1' / '7.4-90080' -> {major, build, nano}"""
+    m = re.search(r"(\d+)(?:\.\d+)*-(\d+)(?:\s+Update\s+(\d+))?", v or "")
+    if not m:
+        return None
+    return {"major": int(m.group(1)), "build": int(m.group(2)), "nano": int(m.group(3) or 0)}
+
+
+def _patch_candidates(dev: dict, build: int, patch_dir: str) -> list[str]:
+    d = patch_dir.rstrip("/")
+    out = [f"{d}/DSM_{dev['modell']}_{build}.pat"]
+    if dev.get("unique"):
+        out.append(f"{d}/{dev['unique']}_{build}.pat")
+    return out
+
+
+def _patch_info(c: DSMClient, paths: list[str]) -> dict[str, dict]:
+    if not paths:
+        return {}
+    res = c.call("SYNO.CMS.PolicyEditor.Patch", "info", version=2, _timeout=120,
+                 files=[{"path": p, "isdir": False} for p in paths])
+    return {f.get("path"): f for f in res.get("filestat", [])}
+
+
+def _parse_schedule(schedule: str | None) -> dict | None:
+    if not schedule:
+        return None
+    try:
+        dt = datetime.strptime(schedule.strip(), "%Y-%m-%d %H:%M")
+    except ValueError:
+        raise RuntimeError("schedule im Format 'YYYY-MM-DD HH:MM' (Zeitzone der CMS-NAS) angeben oder leer lassen für sofort")
+    return {"year": dt.year, "month": dt.month, "day": dt.day, "hour": dt.hour, "minute": dt.minute}
+
+
+def cms_dsm_update(hostnames: list, patch_files: dict = None, patch_dir: str = None,
+                   schedule: str = None, allow_major: bool = False, confirm: bool = False) -> dict:
+    """DSM-Update über das CMS an ausgewählte Geräte verteilen. Ohne confirm nur Vorschau."""
+    if not hostnames:
+        raise RuntimeError("hostnames angeben (Liste der Geräte wie in cms_updates)")
+    patch_files = {str(k).lower(): v for k, v in (patch_files or {}).items()}
+    patch_dir = patch_dir or _env("CMS_PATCH_DIR")
+    schedule_info = _parse_schedule(schedule)
+    wanted = {str(h).lower() for h in hostnames}
+
+    with dsm() as c:
+        if not c.has("SYNO.CMS.DS") or not c.has("SYNO.CMS.Task"):
+            raise RuntimeError("Central Management System ist auf dieser NAS nicht installiert oder nicht erreichbar")
+        devices = [d for d in _cms_devices(c) if (d["hostname"] or "").lower() in wanted]
+        missing = wanted - {(d["hostname"] or "").lower() for d in devices}
+
+        # neueste Version pro Gerät beim Synology-Server (wie cms_updates)
+        targets, seen = [], set()
+        for dev in devices:
+            key = (dev["unique"], dev["dsm_version"])
+            if dev["unique"] and dev["dsm_version"] and key not in seen:
+                seen.add(key)
+                targets.append({"dsm_version": dev["dsm_version"], "unique": dev["unique"]})
+        infos = c.call("SYNO.Core.Upgrade.Group", "info", version=1, _timeout=300,
+                       target=targets).get("result", []) if targets else []
+
+        # Patch-Datei pro Gerät bestimmen und auf der CMS-NAS prüfen
+        wanted_paths, per_dev = [], {}
+        for dev in devices:
+            explicit = patch_files.get((dev["hostname"] or "").lower())
+            if explicit:
+                paths = [explicit]
+            else:
+                info = next((i for i in infos if _model_key(i.get("unique")) == _model_key(dev["unique"])
+                             and i.get("current_version") == dev["dsm_version"]), None)
+                latest = _parse_dsm((info or {}).get("latest_version"))
+                paths = _patch_candidates(dev, latest["build"], patch_dir) if (latest and patch_dir) else []
+            per_dev[dev["id"]] = paths
+            wanted_paths += paths
+        stats = _patch_info(c, list(dict.fromkeys(wanted_paths)))
+
+        plan, abgelehnt = [], []
+        for dev in devices:
+            reason, patch = None, None
+            cur = _parse_dsm(dev["dsm_version"])
+            for p in per_dev[dev["id"]]:
+                st = stats.get(p) or {}
+                if st.get("success") and st.get("exist", True):
+                    patch = st
+                    break
+            if dev["status_code"] != 2:
+                reason = f"nicht online ({dev['status']})"
+            elif dev.get("self"):
+                reason = "ist die CMS-NAS selbst, bitte direkt in deren DSM aktualisieren"
+            elif not patch:
+                reason = ("keine passende .pat-Datei auf der CMS-NAS gefunden"
+                          + (f" (gesucht: {', '.join(per_dev[dev['id']])})" if per_dev[dev["id"]]
+                             else " (patch_dir/CMS_PATCH_DIR oder patch_files angeben)"))
+            else:
+                new = _parse_dsm(patch.get("version"))
+                if _model_key(patch.get("model")) != _model_key(dev["unique"]):
+                    reason = f"Patch ist für ein anderes Modell ({patch.get('model')})"
+                elif not cur or not new or new["build"] <= cur["build"]:
+                    reason = f"Patch {patch.get('version')} ist nicht neuer als {dev['dsm_version']}"
+                elif new["major"] != cur["major"] and not allow_major:
+                    reason = (f"Major-Upgrade {dev['dsm_version']} -> {patch.get('version')} "
+                              f"nur mit allow_major=true")
+            if reason:
+                abgelehnt.append({"hostname": dev["hostname"], "grund": reason})
+                continue
+            plan.append({
+                "id": dev["id"], "hostname": dev["hostname"], "host": dev["host"],
+                "http_port": dev["http_port"] or 0, "dsm_version": dev["dsm_version"], "self": False,
+                "file": patch["path"], "model": dev["modell"], "updated_version": f"DSM {patch.get('version')}",
+            })
+        for h in sorted(missing):
+            abgelehnt.append({"hostname": h, "grund": "nicht im CMS gefunden"})
+
+        result = {
+            "geplant": [{"hostname": p["hostname"], "von": p["dsm_version"], "auf": p["updated_version"],
+                         "datei": p["file"]} for p in plan],
+            "abgelehnt": abgelehnt,
+            "zeitpunkt": schedule or "sofort",
+            "hinweis": "Die Geräte starten beim Update neu und sind einige Minuten nicht erreichbar.",
+        }
+        if not confirm:
+            result["vorschau"] = True
+            result["ausfuehren"] = "Mit confirm=true wird die CMS-Aufgabe angelegt."
+            return result
+        if not _write_allowed():
+            raise RuntimeError("Schreibende Aktionen sind deaktiviert (MCP_ALLOW_WRITE=true im Container setzen)")
+        if not plan:
+            raise RuntimeError("Kein Gerät kann aktualisiert werden, es wurde keine Aufgabe angelegt")
+
+        params = {"action": "dsm_update", "description": "DSM-Aktualisierung (synology-mcp)",
+                  "target_groups": [], "target_servers": [p["id"] for p in plan],
+                  "additional_info": {"dsm_update_params": plan}}
+        if schedule_info:
+            params["schedule_info"] = schedule_info
+        created = c.call("SYNO.CMS.Task", "create", version=1, **params)
+        result["aufgabe"] = created
+        result["vorschau"] = False
+        result["kontrolle"] = "Fortschritt mit cms_tasks (task_uuid) abfragen."
+        return result
+
+
+def cms_tasks(task_uuid: str = None) -> dict:
+    """CMS-Aufgaben (z.B. DSM-Aktualisierung) auflisten oder Fortschritt pro Gerät einer Aufgabe zeigen."""
+    with dsm() as c:
+        if not c.has("SYNO.CMS.Task"):
+            return {"hinweis": "Central Management System ist auf dieser NAS nicht installiert oder nicht erreichbar"}
+        if not task_uuid:
+            d = c.call("SYNO.CMS.Task", "list", version=1)
+            return {"aufgaben": [{"task_uuid": t.get("task_uuid"), "name": t.get("task_name"),
+                                  "aktion": t.get("action_type"), "status": t.get("task_status"),
+                                  "erstellt": _epoch(t.get("create_time")), "fertig": _epoch(t.get("done_time")),
+                                  "ziele": t.get("target_total"), "erledigt": t.get("target_done"),
+                                  "in_arbeit": t.get("target_processing")} for t in d.get("tasks", [])]}
+        d = c.call("SYNO.CMS.Task.Target", "list", version=1, get_task=True, task_uuid=task_uuid, offset=0, limit=200)
+    ziele = []
+    for t in d.get("task_targets", []):
+        extra = t.get("additional_info") or {}
+        if isinstance(extra, str):
+            try:
+                extra = json.loads(extra)
+            except ValueError:
+                extra = {}
+        params, prog = extra.get("dsm_update_params") or {}, extra.get("dsm_update_progress") or {}
+        ziele.append({"hostname": t.get("client_hostname"), "status": t.get("task_target_status"),
+                      "fehler": None if t.get("task_target_fail_reason") in (None, "none") else t.get("task_target_fail_reason"),
+                      "schritt": prog.get("step"), "prozent": prog.get("percent") or None,
+                      "von": params.get("dsm_version"), "auf": params.get("updated_version"),
+                      "fertig": _epoch(t.get("done_time"))})
+    task = d.get("task") or {}
+    return {"aufgabe": {"name": task.get("task_name"), "status": task.get("task_status"),
+                        "erstellt": _epoch(task.get("create_time"))}, "ziele": ziele}
 
 
 def packages() -> list[dict]:
@@ -860,6 +1051,8 @@ TOOL_FUNCS = {
     "backup_tasks": backup_tasks,
     "updates": updates,
     "cms_updates": cms_updates,
+    "cms_dsm_update": cms_dsm_update,
+    "cms_tasks": cms_tasks,
     "packages": packages,
     "shares": shares,
     "connections": connections,
@@ -895,6 +1088,21 @@ async def list_tools():
              description="DSM-Updates aller Geräte im Central Management System (CMS): Hostname, Modell, Status (online/offline), installierte und neueste DSM-Version. Fragt nur ab, lädt und installiert nichts.",
              inputSchema={"type": "object", "properties": {
                  "nur_verfuegbar": {"type": "boolean", "default": False, "description": "Nur Geräte mit verfügbarem Update auflisten"},
+             }}),
+        Tool(name="cms_dsm_update",
+             description="DSM-Update über das Central Management System an ausgewählte Geräte verteilen (wie CMS > Aufgabe > DSM-Aktualisierung). Die Geräte starten dabei neu. Nutzt .pat-Dateien, die bereits auf der CMS-NAS liegen (patch_files pro Gerät oder patch_dir/CMS_PATCH_DIR mit DSM_<Modell>_<Build>.pat). Lehnt offline-Geräte, die CMS-NAS selbst, nicht neuere Builds und Major-Upgrades (ausser allow_major=true) ab. Ohne confirm=true nur Vorschau; ausgeführt nur mit MCP_ALLOW_WRITE=true.",
+             inputSchema={"type": "object", "properties": {
+                 "hostnames": {"type": "array", "items": {"type": "string"}, "description": "Hostnamen wie in cms_updates"},
+                 "patch_files": {"type": "object", "description": "Optional: Hostname -> Pfad der .pat-Datei auf der CMS-NAS"},
+                 "patch_dir": {"type": "string", "description": "Optional: Ordner mit den .pat-Dateien auf der CMS-NAS (sonst CMS_PATCH_DIR)"},
+                 "schedule": {"type": "string", "description": "Optional: 'YYYY-MM-DD HH:MM' in der Zeitzone der CMS-NAS, leer = sofort"},
+                 "allow_major": {"type": "boolean", "default": False, "description": "Major-Upgrade (z.B. DSM 6 -> 7) erlauben"},
+                 "confirm": {"type": "boolean", "default": False, "description": "true = CMS-Aufgabe wirklich anlegen"},
+             }, "required": ["hostnames"]}),
+        Tool(name="cms_tasks",
+             description="CMS-Aufgaben (z.B. DSM-Aktualisierung) auflisten; mit task_uuid Status, Schritt und Fehler pro Gerät.",
+             inputSchema={"type": "object", "properties": {
+                 "task_uuid": {"type": "string", "description": "Optional: UUID einer Aufgabe aus der Liste"},
              }}),
         Tool(name="packages", description="Installierte Pakete mit Version und Status.", inputSchema=_EMPTY),
         Tool(name="shares", description="Freigegebene Ordner mit Volume, Verschlüsselung, Papierkorb und Kontingent.", inputSchema=_EMPTY),

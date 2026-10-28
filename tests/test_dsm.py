@@ -223,11 +223,14 @@ def test_health_report_ok(monkeypatch):
     assert r["zustand"] == "ok" and r["auffaelligkeiten"] == []
 
 
-def test_all_tools_registered_and_no_write_tools():
+def test_all_tools_registered_and_only_known_write_tool():
     import asyncio
     names = {t.name for t in asyncio.run(sm.list_tools())}
     assert names == set(sm.TOOL_FUNCS)
     assert not any(t.name.startswith(("set", "delete", "create", "run")) for t in asyncio.run(sm.list_tools()))
+    # einziges schreibendes Tool hat confirm, Standard false
+    tool = next(t for t in asyncio.run(sm.list_tools()) if t.name == "cms_dsm_update")
+    assert tool.inputSchema["properties"]["confirm"]["default"] is False
 
 
 def test_tls_servername_sets_sni(monkeypatch):
@@ -376,3 +379,132 @@ def test_updates_uses_check_v3_params():
     assert r["update_verfuegbar"] is True and r["version"] == "7.4.1"
     assert sent[0]["method"] == "check" and sent[0]["version"] == "3"
     assert sent[0]["need_auto_smallupdate"] == "true" and sent[0]["user_reading"] == "true"
+
+
+# ---------------------------------------------------------------------------
+# cms_dsm_update / cms_tasks
+# ---------------------------------------------------------------------------
+
+class FakeUpdateClient:
+    """CMS mit vier Geräten: nas-a (7.4-90075, online), nas-b (7.3, online), nas-c (DSM 6, online),
+    nas-off (offline) und cms (die CMS-NAS selbst)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def has(self, api):
+        return True
+
+    def call(self, api, method, version="max", _timeout=None, **params):
+        self.calls.append((api, method, params))
+        if api == "SYNO.CMS.DS":
+            def dev(i, name, model, ver, build, unique, status=2, self_=False):
+                return {"id": i, "hostname": name, "additional": {
+                    "model": model, "dsm_version": ver, "status": status, "host": "192.0.2.%d" % i, "http_port": 0,
+                    "build_number": build, "extra_info": json.dumps({"unique": unique, "self": self_})}}
+            return {"total": 5, "ds_info_list": [
+                dev(1, "nas-a", "DS1825+", "DSM 7.4-90075", 90075, "synology_v1000nk_ds1825+"),
+                dev(2, "nas-b", "RS820+", "DSM 7.3-86009 Update 5", 86009, "synology_denverton_rs820+"),
+                dev(3, "nas-c", "DS216j", "DSM 6.2-25556 Update 8", 25556, "synology_armada38x_ds216j"),
+                dev(4, "nas-off", "DS224+", "DSM 7.2-72806 Update 5", 72806, "synology_geminilake_ds224+", status=10),
+                dev(5, "cms", "RS2423+", "DSM 7.4-90075", 90075, "synology_v1000_rs2423+", self_=True),
+            ]}
+        if api == "SYNO.Core.Upgrade.Group":
+            return {"result": [
+                {"unique": t["unique"], "current_version": t["dsm_version"],
+                 "latest_version": "DSM 7.0.1-42218" if "ds216j" in t["unique"] else "DSM 7.4.1-90080"}
+                for t in params["target"]]}
+        if api == "SYNO.CMS.PolicyEditor.Patch":
+            out = []
+            for f in params["files"]:
+                path = f["path"]
+                m = {"DS1825+": "synology_v1000nk_ds1825+", "RS820+": "synology_denverton_rs820+",
+                     "DS216j": "synology_armada38x_ds216j", "RS2423+": "synology_v1000_rs2423+"}
+                model = next((u for k, u in m.items() if f"DSM_{k}_" in path), None)
+                if model:
+                    ver = "7.0.1-42218" if "DS216j" in path else "7.4-90080"
+                    out.append({"path": path, "success": True, "exist": True, "model": model, "version": ver})
+                else:
+                    out.append({"path": path, "success": False, "exist": False})
+            return {"filestat": out}
+        if api == "SYNO.CMS.Task" and method == "create":
+            return {"task_id": 2, "task_uuid": "UUID-2"}
+        raise AssertionError((api, method))
+
+
+def test_cms_dsm_update_preview_does_not_create(monkeypatch):
+    client = FakeUpdateClient()
+    _fake_dsm(monkeypatch, client)
+    r = sm.cms_dsm_update(["nas-a", "nas-b", "nas-c", "nas-off", "cms", "gibtsnicht"], patch_dir="/volume1/patches")
+    assert r["vorschau"] is True
+    assert {g["hostname"] for g in r["geplant"]} == {"nas-a", "nas-b"}
+    gruende = {a["hostname"]: a["grund"] for a in r["abgelehnt"]}
+    assert "Major" in gruende["nas-c"] and "nicht online" in gruende["nas-off"]
+    assert "CMS-NAS selbst" in gruende["cms"] and "nicht im CMS" in gruende["gibtsnicht"]
+    assert not any(a == "SYNO.CMS.Task" for a, m, p in client.calls)
+
+
+def test_cms_dsm_update_needs_write_flag(monkeypatch):
+    _fake_dsm(monkeypatch, FakeUpdateClient())
+    monkeypatch.delenv("MCP_ALLOW_WRITE", raising=False)
+    with pytest.raises(RuntimeError, match="MCP_ALLOW_WRITE"):
+        sm.cms_dsm_update(["nas-a"], patch_dir="/volume1/patches", confirm=True)
+
+
+def test_cms_dsm_update_creates_task(monkeypatch):
+    client = FakeUpdateClient()
+    _fake_dsm(monkeypatch, client)
+    monkeypatch.setenv("MCP_ALLOW_WRITE", "true")
+    r = sm.cms_dsm_update(["nas-a", "nas-c"], patch_dir="/volume1/patches", schedule="2026-11-01 02:30", confirm=True)
+    create = next(p for a, m, p in client.calls if a == "SYNO.CMS.Task" and m == "create")
+    assert create["action"] == "dsm_update" and create["target_servers"] == [1]
+    up = create["additional_info"]["dsm_update_params"][0]
+    assert up["file"] == "/volume1/patches/DSM_DS1825+_90080.pat" and up["updated_version"] == "DSM 7.4-90080"
+    assert create["schedule_info"] == {"year": 2026, "month": 11, "day": 1, "hour": 2, "minute": 30}
+    assert r["aufgabe"]["task_uuid"] == "UUID-2"
+
+
+def test_cms_dsm_update_allow_major_and_explicit_file(monkeypatch):
+    client = FakeUpdateClient()
+    _fake_dsm(monkeypatch, client)
+    r = sm.cms_dsm_update(["nas-c"], patch_files={"NAS-C": "/x/DSM_DS216j_42218.pat"}, allow_major=True)
+    assert r["geplant"][0]["datei"] == "/x/DSM_DS216j_42218.pat"
+
+
+def test_cms_dsm_update_rejects_wrong_model_and_older(monkeypatch):
+    client = FakeUpdateClient()
+    _fake_dsm(monkeypatch, client)
+    r = sm.cms_dsm_update(["nas-a", "nas-b"], patch_files={"nas-a": "/x/DSM_RS820+_90080.pat",
+                                                          "nas-b": "/x/DSM_RS820+_90080.pat"})
+    gruende = {a["hostname"]: a["grund"] for a in r["abgelehnt"]}
+    assert "anderes Modell" in gruende["nas-a"] and [g["hostname"] for g in r["geplant"]] == ["nas-b"]
+
+
+def test_cms_dsm_update_bad_schedule(monkeypatch):
+    _fake_dsm(monkeypatch, FakeUpdateClient())
+    with pytest.raises(RuntimeError, match="YYYY-MM-DD"):
+        sm.cms_dsm_update(["nas-a"], schedule="morgen")
+
+
+def test_cms_tasks_parses_targets(monkeypatch):
+    class C:
+        def has(self, api):
+            return True
+
+        def call(self, api, method, version="max", _timeout=None, **params):
+            assert api == "SYNO.CMS.Task.Target" and params["task_uuid"] == "U"
+            info = json.dumps({"dsm_update_params": {"dsm_version": "DSM 7.4-90075", "updated_version": "DSM 7.4-90080"},
+                               "dsm_update_progress": {"step": "failed", "percent": ""}})
+            return {"task": {"task_name": "DSM-Aktualisierung", "task_status": "failed"},
+                    "task_targets": [{"client_hostname": "nas-a", "task_target_status": "failed",
+                                      "task_target_fail_reason": "client_internal_error", "additional_info": info}]}
+    _fake_dsm(monkeypatch, C())
+    r = sm.cms_tasks("U")
+    z = r["ziele"][0]
+    assert z["fehler"] == "client_internal_error" and z["schritt"] == "failed" and z["auf"] == "DSM 7.4-90080"
+
+
+def test_parse_dsm():
+    assert sm._parse_dsm("DSM 7.4.1-90080 Update 1") == {"major": 7, "build": 90080, "nano": 1}
+    assert sm._parse_dsm("7.0.1-42218") == {"major": 7, "build": 42218, "nano": 0}
+    assert sm._parse_dsm("kaputt") is None

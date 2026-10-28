@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4
+
+- Neues Tool `cms_dsm_update`: DSM-Update über das Central Management System an ausgewählte Geräte verteilen (CMS-Aufgabe `dsm_update`, wie im Webinterface). Nutzt `.pat`-Dateien auf der CMS-NAS (`patch_dir`/`CMS_PATCH_DIR` oder `patch_files`), prüft sie vorher über das CMS, lehnt offline-Geräte, die CMS-NAS selbst, falsches Modell, nicht neuere Builds und Major-Upgrades (ohne `allow_major`) ab, optional geplant (`schedule`). Ohne `confirm=true` nur Vorschau, ausgeführt nur mit `MCP_ALLOW_WRITE=true`.
+- Neues Tool `cms_tasks`: CMS-Aufgaben auflisten und Fortschritt/Fehler pro Gerät.
+- `cms_updates` liest zusätzlich Host, Port und Build der Geräte (intern für `cms_dsm_update`).
+
 ## 0.3
 
 - Zertifikats-Pinning (`DSM_TLS_FINGERPRINT`) greift jetzt im TLS-Handshake statt erst nach der Antwort: Das DSM-Zertifikat wird einmal ohne Zugangsdaten geholt, mit dem Fingerprint verglichen und als einzige Vertrauensbasis in den SSL-Kontext geladen. Vorher wurde mit `verify=False` verbunden und das Zertifikat erst nach dem Response verglichen, der Login mit Passwort konnte so auf einer neuen Verbindung an eine falsche Gegenstelle gehen. Mit `DSM_TLS_SERVERNAME` wird zusätzlich der Name geprüft. Der separate Preflight-Request entfällt.
