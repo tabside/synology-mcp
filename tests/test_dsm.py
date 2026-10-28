@@ -391,9 +391,16 @@ class FakeUpdateClient:
 
     def __init__(self):
         self.calls = []
+        self.logins = 0
 
     def has(self, api):
         return True
+
+    def login(self):
+        self.logins += 1
+
+    def logout(self):
+        pass
 
     def call(self, api, method, version="max", _timeout=None, **params):
         self.calls.append((api, method, params))

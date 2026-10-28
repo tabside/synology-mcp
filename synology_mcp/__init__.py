@@ -693,14 +693,23 @@ def _patch_info(c: DSMClient, paths: list[str]) -> dict[str, dict]:
     Datei komplett mit Fehler 101, darum pro Datei ein Aufruf; 101 = Datei fehlt."""
     out = {}
     for p in paths:
-        try:
-            res = c.call("SYNO.CMS.PolicyEditor.Patch", "info", version=2, _timeout=120,
-                         files=[{"path": p, "isdir": False}])
-        except DSMError as e:
-            if e.code == 101:
-                out[p] = {"path": p, "success": False, "exist": False}
-                continue
-            raise
+        res = None
+        for attempt in range(2):
+            try:
+                res = c.call("SYNO.CMS.PolicyEditor.Patch", "info", version=2, _timeout=120,
+                             files=[{"path": p, "isdir": False}])
+                break
+            except DSMError as e:
+                if e.code not in (101, 119):
+                    raise
+                # Nach diesem Fehler ist die Session teils ungültig (119): neu anmelden
+                c.logout()
+                c.login()
+                if e.code == 101:
+                    break
+        if res is None:
+            out[p] = {"path": p, "success": False, "exist": False}
+            continue
         for f in res.get("filestat", []):
             out[f.get("path")] = f
     return out
