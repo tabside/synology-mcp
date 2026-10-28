@@ -436,7 +436,11 @@ class FakeUpdateClient:
                     raise sm.DSMError(api, method, 101)  # wie das echte CMS bei fehlender Datei
             return {"filestat": out}
         if api == "SYNO.CMS.Task" and method == "create":
-            return {"task_id": 2, "task_uuid": "UUID-2"}
+            return {}
+        if api == "SYNO.CMS.Task" and method == "list":
+            return {"tasks": [{"action_type": "dsm_update", "create_time": 1, "task_uuid": "UUID-1"},
+                              {"action_type": "dsm_update", "create_time": 2, "task_uuid": "UUID-2",
+                               "task_status": "processing"}]}
         raise AssertionError((api, method))
 
 

@@ -825,6 +825,12 @@ def cms_dsm_update(hostnames: list, patch_files: dict = None, patch_dir: str = N
         if schedule_info:
             params["schedule_info"] = schedule_info
         created = c.call("SYNO.CMS.Task", "create", version=1, **params)
+        if not (created or {}).get("task_uuid"):
+            # create liefert keine Daten zurück: neueste DSM-Aufgabe nachschlagen
+            tasks = c.call("SYNO.CMS.Task", "list", version=1).get("tasks", [])
+            newest = max((t for t in tasks if t.get("action_type") == "dsm_update"),
+                         key=lambda t: t.get("create_time") or 0, default=None)
+            created = {"task_uuid": newest.get("task_uuid"), "status": newest.get("task_status")} if newest else created
         result["aufgabe"] = created
         result["vorschau"] = False
         result["kontrolle"] = "Fortschritt mit cms_tasks (task_uuid) abfragen."
@@ -857,7 +863,7 @@ def cms_tasks(task_uuid: str = None) -> dict:
                       "fehler": None if t.get("task_target_fail_reason") in (None, "none") else t.get("task_target_fail_reason"),
                       "schritt": prog.get("step"), "prozent": prog.get("percent") or None,
                       "von": params.get("dsm_version"), "auf": params.get("updated_version"),
-                      "fertig": _epoch(t.get("done_time"))})
+                      "fertig": _epoch(t.get("done_time")) if t.get("task_target_status") not in ("processing", "waiting") else None})
     task = d.get("task") or {}
     return {"aufgabe": {"name": task.get("task_name"), "status": task.get("task_status"),
                         "erstellt": _epoch(task.get("create_time"))}, "ziele": ziele}
